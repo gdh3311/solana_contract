@@ -84,7 +84,7 @@ pub struct SetValue<'info> {
 #[derive(Accounts)]
 pub struct GetInfo<'info> {
     #[account(
-        seeds = [b"state", user.key().as_ref()], // 같은 시드로 계정 찾기
+        seeds = [b"state", user.key().as_ref()], // 같은 시드로 계정    찾기  
         bump
     )]
     pub state: Account<'info, StateAccount>,

@@ -6,103 +6,98 @@ declare_id!("3NEr6ZiHYsW6eP2w6tk84yoVdWsRiDyYoe5qxY6qrTKL");
 pub mod solana_contract {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let state = &mut ctx.accounts.state;
-        state.value = 0;
-        state.message = "Hello Solana!".to_string();
-        state.counter = 0;
-        msg!("Initialized - value: {}, message: '{}'", state.value, state.message);
+    // mapping에 값 저장 (입금)
+    pub fn deposit(ctx: Context<Deposit>, hash_key: String, amount: u64) -> Result<()> {
+        require!(hash_key.len() <= 32, CustomError::KeyTooLong);
+        require!(amount > 0, CustomError::InvalidAmount);
+        
+        let balance_account = &mut ctx.accounts.balance_account;
+        balance_account.hash_key = hash_key.clone();
+        balance_account.balance = amount;
+
+        // SOL 전송
+        let ix = anchor_lang::solana_program::system_instruction::transfer(
+            &ctx.accounts.user.key(),
+            &ctx.accounts.balance_account.key(),
+            amount,
+        );
+        anchor_lang::solana_program::program::invoke(
+            &ix,
+            &[
+                ctx.accounts.user.to_account_info(),
+                ctx.accounts.balance_account.to_account_info(),
+            ],
+        )?;
+
+        msg!("Deposited {} lamports with key: {}", amount, hash_key);
         Ok(())
     }
 
-    pub fn set_value(ctx: Context<SetValue>, new_value: u64) -> Result<()> {
-        let state = &mut ctx.accounts.state;
-        state.value = new_value;
-        msg!("Updated value: {}", state.value);
-        Ok(())
-    }
+    // mapping에서 값 가져오기 (출금)
+    pub fn withdraw(ctx: Context<Withdraw>, hash_key: String) -> Result<()> {
+        let balance_account = &ctx.accounts.balance_account;
+        
+        require!(balance_account.hash_key == hash_key, CustomError::InvalidKey);
+        require!(balance_account.balance > 0, CustomError::NoBalance);
 
-    pub fn set_message(ctx: Context<SetValue>, new_message: String) -> Result<()> {
-        let state = &mut ctx.accounts.state;
-        require!(new_message.len() <= 50, CustomError::MessageTooLong);
-        state.message = new_message.clone();
-        msg!("Updated message: '{}'", new_message);
-        Ok(())
-    }
+        let amount = balance_account.balance;
 
-    pub fn increment_counter(ctx: Context<SetValue>) -> Result<()> {
-        let state = &mut ctx.accounts.state;
-        state.counter = state.counter.checked_add(1).ok_or(CustomError::CounterOverflow)?;
-        msg!("Counter incremented to: {}", state.counter);
-        Ok(())
-    }
+        // SOL 전송
+        **ctx.accounts.balance_account.to_account_info().try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += amount;
 
-    pub fn get_info(ctx: Context<GetInfo>) -> Result<StateInfo> {
-        let state = &ctx.accounts.state;
-        Ok(StateInfo {
-            value: state.value,
-            message: state.message.clone(),
-            counter: state.counter,
-            total_interactions: state.value + state.counter,
-        })
+        msg!("Withdrawn {} lamports with key: {}", amount, hash_key);
+        Ok(())
     }
 }
 
+// mapping의 value 구조체
 #[account]
-pub struct StateAccount {
-    pub value: u64,           // 8 bytes
-    pub message: String,      // 4 + message length (최대 50자)
-    pub counter: u64,         // 8 bytes
+pub struct BalanceAccount {
+    pub hash_key: String,
+    pub balance: u64,
 }
 
+// deposit: balances[hash] = amount
 #[derive(Accounts)]
-pub struct Initialize<'info> {
+#[instruction(hash_key: String)]
+pub struct Deposit<'info> {
     #[account(
-        init, 
-        payer = user, 
-        space = 8 + 8 + 4 + 50 + 8,
-        seeds = [b"state", user.key().as_ref()], // PDA 시드 추가
-        bump                                      // bump 추가
+        init,
+        payer = user,
+        space = 8 + 4 + 32 + 8,
+        seeds = [b"balance", hash_key.as_bytes()],  // mapping의 key
+        bump
     )]
-    pub state: Account<'info, StateAccount>,
+    pub balance_account: Account<'info, BalanceAccount>,
     #[account(mut)]
     pub user: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
+// withdraw: amount = balances[hash]
 #[derive(Accounts)]
-pub struct SetValue<'info> {
+#[instruction(hash_key: String)]
+pub struct Withdraw<'info> {
     #[account(
         mut,
-        seeds = [b"state", user.key().as_ref()], // 같은 시드로 계정 찾기
+        close = user,
+        seeds = [b"balance", hash_key.as_bytes()],  // mapping의 key로 찾기
         bump
     )]
-    pub state: Account<'info, StateAccount>,
-    pub user: Signer<'info>, // user 추가 (시드에 필요)
-}
-
-#[derive(Accounts)]
-pub struct GetInfo<'info> {
-    #[account(
-        seeds = [b"state", user.key().as_ref()], // 같은 시드로 계정    찾기  
-        bump
-    )]
-    pub state: Account<'info, StateAccount>,
-    pub user: Signer<'info>, // user 추가 (시드에 필요)
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize)]
-pub struct StateInfo {
-    pub value: u64,
-    pub message: String,
-    pub counter: u64,
-    pub total_interactions: u64,
+    pub balance_account: Account<'info, BalanceAccount>,
+    #[account(mut)]
+    pub user: Signer<'info>,
 }
 
 #[error_code]
 pub enum CustomError {
-    #[msg("Message is too long. Maximum 50 characters allowed.")]
-    MessageTooLong,
-    #[msg("Counter overflow occurred.")]
-    CounterOverflow,
-}    
+    #[msg("Key is too long. Maximum 32 bytes.")]
+    KeyTooLong,
+    #[msg("Invalid amount. Must be greater than 0.")]
+    InvalidAmount,
+    #[msg("Invalid key.")]
+    InvalidKey,
+    #[msg("No balance found.")]
+    NoBalance,
+}

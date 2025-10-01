@@ -6,7 +6,6 @@ declare_id!("3NEr6ZiHYsW6eP2w6tk84yoVdWsRiDyYoe5qxY6qrTKL");
 pub mod solana_contract {
     use super::*;
 
-    // mapping에 값 저장 (입금)
     pub fn deposit(ctx: Context<Deposit>, hash_key: String, amount: u64) -> Result<()> {
         require!(hash_key.len() <= 32, CustomError::KeyTooLong);
         require!(amount > 0, CustomError::InvalidAmount);
@@ -14,8 +13,8 @@ pub mod solana_contract {
         let balance_account = &mut ctx.accounts.balance_account;
         balance_account.hash_key = hash_key.clone();
         balance_account.balance = amount;
+        balance_account.owner = ctx.accounts.user.key();  // ✅ owner 저장!
 
-        // SOL 전송
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.user.key(),
             &ctx.accounts.balance_account.key(),
@@ -33,7 +32,6 @@ pub mod solana_contract {
         Ok(())
     }
 
-    // mapping에서 값 가져오기 (출금)
     pub fn withdraw(ctx: Context<Withdraw>, hash_key: String) -> Result<()> {
         let balance_account = &ctx.accounts.balance_account;
         
@@ -42,7 +40,6 @@ pub mod solana_contract {
 
         let amount = balance_account.balance;
 
-        // SOL 전송
         **ctx.accounts.balance_account.to_account_info().try_borrow_mut_lamports()? -= amount;
         **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += amount;
 
@@ -51,22 +48,21 @@ pub mod solana_contract {
     }
 }
 
-// mapping의 value 구조체
 #[account]
 pub struct BalanceAccount {
     pub hash_key: String,
     pub balance: u64,
+    pub owner: Pubkey,
 }
 
-// deposit: balances[hash] = amount
 #[derive(Accounts)]
 #[instruction(hash_key: String)]
 pub struct Deposit<'info> {
     #[account(
         init,
         payer = user,
-        space = 8 + 4 + 32 + 8,
-        seeds = [b"balance", hash_key.as_bytes()],  // mapping의 key
+        space = 8 + 4 + 32 + 8 + 32,
+        seeds = [b"balance", hash_key.as_bytes()],
         bump
     )]
     pub balance_account: Account<'info, BalanceAccount>,
@@ -75,19 +71,24 @@ pub struct Deposit<'info> {
     pub system_program: Program<'info, System>,
 }
 
-// withdraw: amount = balances[hash]
 #[derive(Accounts)]
 #[instruction(hash_key: String)]
 pub struct Withdraw<'info> {
     #[account(
         mut,
-        close = user,
-        seeds = [b"balance", hash_key.as_bytes()],  // mapping의 key로 찾기
-        bump
+        seeds = [b"balance", hash_key.as_bytes()],
+        bump,
+        has_one = owner,  // ✅ 필수! balance_account.owner == owner 검증
+        close = owner
     )]
     pub balance_account: Account<'info, BalanceAccount>,
+    
     #[account(mut)]
     pub user: Signer<'info>,
+    
+    /// CHECK: Validated by has_one constraint
+    #[account(mut)]
+    pub owner: UncheckedAccount<'info>,
 }
 
 #[error_code]

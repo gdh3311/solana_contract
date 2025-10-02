@@ -2,7 +2,9 @@ use anchor_lang::prelude::*;
 
 declare_id!("3NEr6ZiHYsW6eP2w6tk84yoVdWsRiDyYoe5qxY6qrTKL");
 
-const ADMIN_PUBKEY: Pubkey = pubkey!("JAZZAQu3Nz6K2Mdy2y2pJmcWK7VNJW6Bhrwh2Fio1xPj"); 
+const ADMIN_PUBKEY: Pubkey = pubkey!("JAZZAQu3Nz6K2Mdy2y2pJmcWK7VNJW6Bhrwh2Fio1xPj");
+const USER_RENT_PERCENTAGE: u64 = 30; // 유저는 30%만 부담
+const FIXED_RENT: u64 = 1_253_000; 
 
 #[program]
 pub mod solana_contract {
@@ -13,13 +15,26 @@ pub mod solana_contract {
         require!(amount > 0, CustomError::InvalidAmount);
 
         let balance_account = &mut ctx.accounts.balance_account;
-        balance_account.hash_key = hash_key.clone();  // String 그대로 저장
+        balance_account.hash_key = hash_key.clone();
         balance_account.balance = amount;
+        balance_account.depositor = ctx.accounts.user.key(); // ⭐ 입금자 저장
+
+        // Rent 계산
+        let user_rent_portion = FIXED_RENT
+            .checked_mul(USER_RENT_PERCENTAGE)
+            .ok_or(CustomError::Overflow)?
+            .checked_div(100)
+            .ok_or(CustomError::Overflow)?;
+
+        // User가 입금액 + rent 30% 전송
+        let total_from_user = amount
+            .checked_add(user_rent_portion)
+            .ok_or(CustomError::Overflow)?;
 
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.user.key(),
             &ctx.accounts.balance_account.key(),
-            amount,
+            total_from_user,
         );
         anchor_lang::solana_program::program::invoke(
             &ix,
@@ -29,7 +44,9 @@ pub mod solana_contract {
             ],
         )?;
 
-        msg!("Deposited {} lamports with key: {}", amount, hash_key);
+        msg!("Deposited {} lamports by {}", amount, ctx.accounts.user.key());
+        msg!("User paid {}% of rent: {} lamports", USER_RENT_PERCENTAGE, user_rent_portion);
+        msg!("Admin paid {}% of rent: {} lamports", 100 - USER_RENT_PERCENTAGE, FIXED_RENT - user_rent_portion);
         Ok(())
     }
 
@@ -41,18 +58,22 @@ pub mod solana_contract {
 
         let amount = balance_account.balance;
 
+        // User에게 예치금만 반환
         **ctx.accounts.balance_account.to_account_info().try_borrow_mut_lamports()? -= amount;
         **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += amount;
 
-        msg!("Withdrawn {} lamports to user, rent sent to admin", amount);
+        // close = depositor로 rent를 원래 입금자에게 반환! ⭐
+        msg!("Withdrawn {} lamports to user", amount);
+        msg!("Rent {} lamports returned to original depositor: {}", FIXED_RENT, balance_account.depositor);
         Ok(())
     }
 }
 
 #[account]
 pub struct BalanceAccount {
-    pub hash_key: String,    // String으로 유지
-    pub balance: u64,         
+    pub hash_key: String,
+    pub balance: u64,
+    pub depositor: Pubkey, // ⭐ 원래 입금자 주소 저장
 }
 
 #[derive(Accounts)]
@@ -60,8 +81,8 @@ pub struct BalanceAccount {
 pub struct Deposit<'info> {
     #[account(
         init,
-        payer = user,
-        space = 8 + 4 + 32 + 8,  // 52 bytes
+        payer = admin,
+        space = 8 + 4 + 32 + 8 + 32, // ⭐ +32 for Pubkey
         seeds = [b"balance", hash_key.as_bytes()],
         bump
     )]
@@ -69,6 +90,13 @@ pub struct Deposit<'info> {
 
     #[account(mut)]
     pub user: Signer<'info>,
+
+    /// CHECK: Admin pays 70% of rent
+    #[account(
+        mut,
+        constraint = admin.key() == ADMIN_PUBKEY @ CustomError::InvalidAdmin
+    )]
+    pub admin: Signer<'info>,
 
     pub system_program: Program<'info, System>,
 }
@@ -80,19 +108,19 @@ pub struct Withdraw<'info> {
         mut,
         seeds = [b"balance", hash_key.as_bytes()],
         bump,
-        close = admin,
+        close = depositor, // ⭐ Rent를 원래 입금자에게 반환!
     )]
     pub balance_account: Account<'info, BalanceAccount>,
 
     #[account(mut)]
-    pub user: Signer<'info>,
+    pub user: Signer<'info>, // 출금하는 사람
 
-    /// CHECK: Admin address verified by constraint
+    /// CHECK: Original depositor from balance_account
     #[account(
         mut,
-        constraint = admin.key() == ADMIN_PUBKEY @ CustomError::InvalidAdmin
+        constraint = depositor.key() == balance_account.depositor @ CustomError::InvalidDepositor
     )]
-    pub admin: UncheckedAccount<'info>, 
+    pub depositor: AccountInfo<'info>, // ⭐ 원래 입금자 (rent 받을 사람)
 }
 
 #[error_code]
@@ -105,6 +133,10 @@ pub enum CustomError {
     InvalidKey,
     #[msg("No balance found.")]
     NoBalance,
-    #[msg("Invalid admin address.")] 
+    #[msg("Invalid admin address.")]
     InvalidAdmin,
+    #[msg("Arithmetic overflow.")]
+    Overflow,
+    #[msg("Invalid original depositor.")]
+    InvalidDepositor,
 }

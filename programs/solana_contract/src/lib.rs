@@ -17,36 +17,46 @@ pub mod solana_contract {
         let balance_account = &mut ctx.accounts.balance_account;
         balance_account.hash_key = hash_key.clone();
         balance_account.balance = amount;
-        balance_account.depositor = ctx.accounts.user.key(); // ⭐ 입금자 저장
 
         // Rent 계산
-        let user_rent_portion = FIXED_RENT
+        let lent =Rent::get()?.minimum_balance(52);
+        let user_rent_portion = lent
             .checked_mul(USER_RENT_PERCENTAGE)
             .ok_or(CustomError::Overflow)?
             .checked_div(100)
             .ok_or(CustomError::Overflow)?;
 
-        // User가 입금액 + rent 30% 전송
-        let total_from_user = amount
-            .checked_add(user_rent_portion)
-            .ok_or(CustomError::Overflow)?;
-
-        let ix = anchor_lang::solana_program::system_instruction::transfer(
+        // 1. User가 예치금(amount)을 balance_account에 전송
+        let ix_amount = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.user.key(),
             &ctx.accounts.balance_account.key(),
-            total_from_user,
+            amount,
         );
         anchor_lang::solana_program::program::invoke(
-            &ix,
+            &ix_amount,
             &[
                 ctx.accounts.user.to_account_info(),
                 ctx.accounts.balance_account.to_account_info(),
             ],
         )?;
 
+        // 2. User가 rent 30%를 admin에게 직접 전송
+        let ix_rent = anchor_lang::solana_program::system_instruction::transfer(
+            &ctx.accounts.user.key(),
+            &ctx.accounts.admin.key(),
+            user_rent_portion,
+        );
+        anchor_lang::solana_program::program::invoke(
+            &ix_rent,
+            &[
+                ctx.accounts.user.to_account_info(),
+                ctx.accounts.admin.to_account_info(),
+            ],
+        )?;
+
         msg!("Deposited {} lamports by {}", amount, ctx.accounts.user.key());
-        msg!("User paid {}% of rent: {} lamports", USER_RENT_PERCENTAGE, user_rent_portion);
-        msg!("Admin paid {}% of rent: {} lamports", 100 - USER_RENT_PERCENTAGE, FIXED_RENT - user_rent_portion);
+        msg!("User paid {}% of rent ({} lamports) to admin", USER_RENT_PERCENTAGE, user_rent_portion);
+        msg!("Admin will pay {}% of rent: {} lamports", 100 - USER_RENT_PERCENTAGE, FIXED_RENT - user_rent_portion);
         Ok(())
     }
 
@@ -58,13 +68,13 @@ pub mod solana_contract {
 
         let amount = balance_account.balance;
 
-        // User에게 예치금만 반환
+        // User(출금자)에게 예치금만 반환
         **ctx.accounts.balance_account.to_account_info().try_borrow_mut_lamports()? -= amount;
         **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += amount;
 
-        // close = depositor로 rent를 원래 입금자에게 반환! ⭐
-        msg!("Withdrawn {} lamports to user", amount);
-        msg!("Rent {} lamports returned to original depositor: {}", FIXED_RENT, balance_account.depositor);
+        // close = admin으로 설정되어 있어서 rent 전액이 admin에게 반환됨
+        msg!("Withdrawn {} lamports to user {}", amount, ctx.accounts.user.key());
+        msg!("Full rent ({} lamports) will be returned to admin", FIXED_RENT);
         Ok(())
     }
 }
@@ -73,7 +83,6 @@ pub mod solana_contract {
 pub struct BalanceAccount {
     pub hash_key: String,
     pub balance: u64,
-    pub depositor: Pubkey, // ⭐ 원래 입금자 주소 저장
 }
 
 #[derive(Accounts)]
@@ -81,8 +90,8 @@ pub struct BalanceAccount {
 pub struct Deposit<'info> {
     #[account(
         init,
-        payer = admin,
-        space = 8 + 4 + 32 + 8 + 32, // ⭐ +32 for Pubkey
+        payer = admin,  // admin이 70% rent 부담
+        space = 8 + 4 + 32 + 8,  // ⭐ space 계산 수정 (32 제거)
         seeds = [b"balance", hash_key.as_bytes()],
         bump
     )]
@@ -91,7 +100,7 @@ pub struct Deposit<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
-    /// CHECK: Admin pays 70% of rent
+    /// CHECK: Admin pays 70% of rent and receives 30% from user
     #[account(
         mut,
         constraint = admin.key() == ADMIN_PUBKEY @ CustomError::InvalidAdmin
@@ -108,19 +117,21 @@ pub struct Withdraw<'info> {
         mut,
         seeds = [b"balance", hash_key.as_bytes()],
         bump,
-        close = depositor, // ⭐ Rent를 원래 입금자에게 반환!
+        close = admin,  // ⭐ Rent 전액을 admin에게 반환!
     )]
     pub balance_account: Account<'info, BalanceAccount>,
 
     #[account(mut)]
-    pub user: Signer<'info>, // 출금하는 사람
+    pub user: Signer<'info>, // 출금하는 사람 (B)
 
-    /// CHECK: Original depositor from balance_account
+    /// CHECK: Admin receives all rent back
     #[account(
         mut,
-        constraint = depositor.key() == balance_account.depositor @ CustomError::InvalidDepositor
+        constraint = admin.key() == ADMIN_PUBKEY @ CustomError::InvalidAdmin
     )]
-    pub depositor: AccountInfo<'info>, // ⭐ 원래 입금자 (rent 받을 사람)
+    pub admin: AccountInfo<'info>,  // ⭐ admin이 rent 전액 받음
+
+    pub system_program: Program<'info, System>,
 }
 
 #[error_code]
@@ -137,6 +148,5 @@ pub enum CustomError {
     InvalidAdmin,
     #[msg("Arithmetic overflow.")]
     Overflow,
-    #[msg("Invalid original depositor.")]
-    InvalidDepositor,
+    // InvalidDepositor 에러도 제거 ✅
 }

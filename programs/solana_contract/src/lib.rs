@@ -1,88 +1,79 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::hash::hash as sha256_hash;
+use anchor_lang::solana_program::keccak::hash as keccak_hash;
+use bs58;
 
 declare_id!("3NEr6ZiHYsW6eP2w6tk84yoVdWsRiDyYoe5qxY6qrTKL");
-
-const ADMIN_PUBKEY: Pubkey = pubkey!("JAZZAQu3Nz6K2Mdy2y2pJmcWK7VNJW6Bhrwh2Fio1xPj");
-const USER_RENT_PERCENTAGE: u64 = 30; // 유저는 30%만 부담
-const FIXED_RENT: u64 = 1_253_000; 
 
 #[program]
 pub mod solana_contract {
     use super::*;
 
+    /// 💰 Deposit: h2(=hashed key)에 대한 예치
     pub fn deposit(ctx: Context<Deposit>, hash_key: String, amount: u64) -> Result<()> {
-        require!(hash_key.len() <= 32, CustomError::KeyTooLong);
+        require!(hash_key.len() <= 64, CustomError::KeyTooLong);
         require!(amount > 0, CustomError::InvalidAmount);
 
         let balance_account = &mut ctx.accounts.balance_account;
         balance_account.hash_key = hash_key.clone();
-        balance_account.balance = amount;
 
-        // Rent 계산
-        let lent =Rent::get()?.minimum_balance(52);
-        let user_rent_portion = lent
-            .checked_mul(USER_RENT_PERCENTAGE)
-            .ok_or(CustomError::Overflow)?
-            .checked_div(100)
-            .ok_or(CustomError::Overflow)?;
-
-        // 1. User가 예치금(amount)을 balance_account에 전송
-        let ix_amount = anchor_lang::solana_program::system_instruction::transfer(
+        // SOL transfer to PDA
+        let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.user.key(),
             &ctx.accounts.balance_account.key(),
             amount,
         );
         anchor_lang::solana_program::program::invoke(
-            &ix_amount,
+            &ix,
             &[
                 ctx.accounts.user.to_account_info(),
                 ctx.accounts.balance_account.to_account_info(),
             ],
         )?;
 
-        // 2. User가 rent 30%를 admin에게 직접 전송
-        let ix_rent = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.user.key(),
-            &ctx.accounts.admin.key(),
-            user_rent_portion,
-        );
-        anchor_lang::solana_program::program::invoke(
-            &ix_rent,
-            &[
-                ctx.accounts.user.to_account_info(),
-                ctx.accounts.admin.to_account_info(),
-            ],
-        )?;
-
-        msg!("Deposited {} lamports by {}", amount, ctx.accounts.user.key());
-        msg!("User paid {}% of rent ({} lamports) to admin", USER_RENT_PERCENTAGE, user_rent_portion);
-        msg!("Admin will pay {}% of rent: {} lamports", 100 - USER_RENT_PERCENTAGE, FIXED_RENT - user_rent_portion);
+        msg!("✅ Deposited {} lamports for hash_key(h2): {}", amount, hash_key);
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>, hash_key: String) -> Result<()> {
+    pub fn withdraw(ctx: Context<Withdraw>, h1: String) -> Result<()> {
         let balance_account = &ctx.accounts.balance_account;
 
-        require!(balance_account.hash_key == hash_key, CustomError::InvalidKey);
-        require!(balance_account.balance > 0, CustomError::NoBalance);
+        let computed_h2 = h2_pattern(h1.clone());
 
-        let amount = balance_account.balance;
+        require!(
+            computed_h2 == balance_account.hash_key,
+            CustomError::InvalidKey
+        );
 
-        // User(출금자)에게 예치금만 반환
-        **ctx.accounts.balance_account.to_account_info().try_borrow_mut_lamports()? -= amount;
-        **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += amount;
+        let total_lamports = balance_account.to_account_info().lamports();
 
-        // close = admin으로 설정되어 있어서 rent 전액이 admin에게 반환됨
-        msg!("Withdrawn {} lamports to user {}", amount, ctx.accounts.user.key());
-        msg!("Full rent ({} lamports) will be returned to admin", FIXED_RENT);
+        **balance_account.to_account_info().try_borrow_mut_lamports()? -= total_lamports;
+        **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += total_lamports;
+
+        ctx.accounts.balance_account.close(ctx.accounts.user.to_account_info())?;
+
+        msg!("💸 Withdrawn {} lamports to user {}", total_lamports, ctx.accounts.user.key());
         Ok(())
     }
 }
 
+/// h2 = keccak → sha256 → keccak → sha256 → keccak
+pub fn h2_pattern(input: String) -> String {
+    const H2_DOMAIN: &[u8] = b"kuching";
+    let mut current = [H2_DOMAIN, input.as_bytes()].concat();
+
+    current = keccak_hash(&current).to_bytes().to_vec();
+    current = sha256_hash(&current).to_bytes().to_vec();
+    current = keccak_hash(&current).to_bytes().to_vec();
+    current = sha256_hash(&current).to_bytes().to_vec();
+    current = keccak_hash(&current).to_bytes().to_vec();
+
+    bs58::encode(current).into_string()
+}
+
 #[account]
 pub struct BalanceAccount {
-    pub hash_key: String,
-    pub balance: u64,
+    pub hash_key: String, // h2 저장 (h1 검증용)
 }
 
 #[derive(Accounts)]
@@ -90,8 +81,8 @@ pub struct BalanceAccount {
 pub struct Deposit<'info> {
     #[account(
         init,
-        payer = admin,  // admin이 70% rent 부담
-        space = 8 + 4 + 32 + 8,  // ⭐ space 계산 수정 (32 제거)
+        payer = user,
+        space =56 , 
         seeds = [b"balance", hash_key.as_bytes()],
         bump
     )]
@@ -99,54 +90,31 @@ pub struct Deposit<'info> {
 
     #[account(mut)]
     pub user: Signer<'info>,
-
-    /// CHECK: Admin pays 70% of rent and receives 30% from user
-    #[account(
-        mut,
-        constraint = admin.key() == ADMIN_PUBKEY @ CustomError::InvalidAdmin
-    )]
-    pub admin: Signer<'info>,
-
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-#[instruction(hash_key: String)]
+#[instruction(h1: String)]
 pub struct Withdraw<'info> {
     #[account(
         mut,
-        seeds = [b"balance", hash_key.as_bytes()],
-        bump,
-        close = admin,  // ⭐ Rent 전액을 admin에게 반환!
+        close = user,
     )]
     pub balance_account: Account<'info, BalanceAccount>,
 
     #[account(mut)]
-    pub user: Signer<'info>, // 출금하는 사람 (B)
-
-    /// CHECK: Admin receives all rent back
-    #[account(
-        mut,
-        constraint = admin.key() == ADMIN_PUBKEY @ CustomError::InvalidAdmin
-    )]
-    pub admin: AccountInfo<'info>,  // ⭐ admin이 rent 전액 받음
-
+    pub user: Signer<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[error_code]
 pub enum CustomError {
-    #[msg("Key is too long. Maximum 32 bytes.")]
+    #[msg("Key is too long. Maximum 64 bytes.")]
     KeyTooLong,
     #[msg("Invalid amount. Must be greater than 0.")]
     InvalidAmount,
-    #[msg("Invalid key.")]
+    #[msg("Invalid key — h1 does not match stored hash.")]
     InvalidKey,
     #[msg("No balance found.")]
     NoBalance,
-    #[msg("Invalid admin address.")]
-    InvalidAdmin,
-    #[msg("Arithmetic overflow.")]
-    Overflow,
-    // InvalidDepositor 에러도 제거 ✅
 }

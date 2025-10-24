@@ -1,112 +1,260 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::hash::hash as sha256_hash;
 use anchor_lang::solana_program::keccak::hash as keccak_hash;
+use anchor_lang::solana_program::hash::hash as sha256_hash;
 
 declare_id!("3NEr6ZiHYsW6eP2w6tk84yoVdWsRiDyYoe5qxY6qrTKL");
 
+const COMMITMENT_DOMAIN: &[u8] = b"anonymous_pool_v1";
+const MIN_DEPOSIT_AMOUNT: u64 = 1_000_000; // 0.001 SOL
+
 #[program]
-pub mod solana_contract {
+pub mod anonymous_pool {
     use super::*;
 
-    pub fn deposit(ctx: Context<Deposit>, hash_key: [u8; 32], amount: u64) -> Result<()> {
-        require!(amount > 0, CustomError::InvalidAmount);
-        ctx.account.
-        let balance_account = &mut ctx.accounts.balance_account;
-        balance_account.hash_key = hash_key;
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        pool.total_deposits = 0;
+        pool.total_withdrawals = 0;
+        pool.active_commitments = 0;
+        pool.total_volume_deposited = 0;  // 추가: 총 거래량
+        pool.total_volume_withdrawn = 0;  // 추가: 총 출금량
+        
+        msg!("✅ Pool initialized");
+        Ok(())
+    }
+
+    pub fn deposit(
+        ctx: Context<Deposit>,
+        commitment: [u8; 32],
+        amount: u64,
+    ) -> Result<()> {
+        // 검증 강화
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        require!(amount >= MIN_DEPOSIT_AMOUNT, ErrorCode::AmountTooSmall);
+
+        let pool = &mut ctx.accounts.pool;
+        let commitment_account = &mut ctx.accounts.commitment_account;
+
+        // 계정 설정
+        commitment_account.commitment = commitment;
+        commitment_account.amount = amount;
+        // 통계 업데이트
+        pool.total_deposits += 1;
+        pool.active_commitments += 1;
+        pool.total_volume_deposited += amount;  // 추가
+
+        // SOL 전송
         let ix = anchor_lang::solana_program::system_instruction::transfer(
-            &ctx.accounts.user.key(),
-            &ctx.accounts.balance_account.key(),
+            &ctx.accounts.depositor.key(),
+            &commitment_account.key(),
             amount,
         );
+
         anchor_lang::solana_program::program::invoke(
             &ix,
             &[
-                ctx.accounts.user.to_account_info(),
-                ctx.accounts.balance_account.to_account_info(),
+                ctx.accounts.depositor.to_account_info(),
+                commitment_account.to_account_info(),
             ],
         )?;
 
+        msg!("✅ Deposit #{} complete", pool.total_deposits);
+        msg!("   Amount: {} lamports ({:.4} SOL)", 
+             amount, 
+             amount as f64 / 1_000_000_000.0);
+        msg!("   Commitment: {:?}", &commitment[0..8]);
+        
         Ok(())
     }
 
-    pub fn withdraw(ctx: Context<Withdraw>, h1: [u8; 32]) -> Result<()> {
-        let balance_account = &ctx.accounts.balance_account;
+   pub fn withdraw(ctx: Context<Withdraw>, h1: [u8; 32]) -> Result<()> {
+    let pool = &mut ctx.accounts.pool;
+    let commitment_account = &ctx.accounts.commitment_account;
+    let nullifier_account = &mut ctx.accounts.nullifier_account;
 
-        let computed_h2 = h2_pattern(h1);
+    // H1 → H2 변환 및 검증
+    let computed_h2 = h2_from_h1(h1);
+    require!(
+        computed_h2 == commitment_account.commitment,
+        ErrorCode::InvalidCommitment
+    );
 
-        require!(
-            computed_h2 == balance_account.hash_key,
-            CustomError::InvalidKey
-        );
+    // 금액 저장
+    let withdraw_amount = commitment_account.amount;
 
-        let total_lamports = balance_account.to_account_info().lamports();
+    // Nullifier 기록
+    nullifier_account.nullifier = h1;
+    nullifier_account.amount_withdrawn = withdraw_amount;
+    nullifier_account.used_at = Clock::get()?.unix_timestamp;
 
-        **balance_account.to_account_info().try_borrow_mut_lamports()? -= total_lamports;
-        **ctx.accounts.user.to_account_info().try_borrow_mut_lamports()? += total_lamports;
+    // 계정의 전체 lamports 가져오기
+    let total_lamports = commitment_account.to_account_info().lamports();
+    
+    // SOL 전송
+    **commitment_account.to_account_info().try_borrow_mut_lamports()? = 0;
+    **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? += total_lamports;
 
-        ctx.accounts.balance_account.close(ctx.accounts.user.to_account_info())?;
+    // 통계 업데이트
+    pool.total_withdrawals += 1;
+    pool.active_commitments = pool.active_commitments.saturating_sub(1);
+    pool.total_volume_withdrawn += withdraw_amount;  // ✅ amount 사용
 
-        msg!("💸 Withdrawn {} lamports to user {}", total_lamports, ctx.accounts.user.key());
+    msg!("💸 Withdrawal complete");
+    msg!("   Amount: {} lamports", withdraw_amount);
+    msg!("   Total received (with rent): {} lamports", total_lamports);
+    
+    Ok(())
+}
+
+    pub fn get_pool_stats(ctx: Context<GetStats>) -> Result<()> {
+        let pool = &ctx.accounts.pool;
+        
+        msg!("📊 Pool Statistics:");
+        msg!("   Total Deposits: {}", pool.total_deposits);
+        msg!("   Total Withdrawals: {}", pool.total_withdrawals);
+        msg!("   Active Commitments: {}", pool.active_commitments);
+        msg!("   Total Volume Deposited: {} SOL", 
+             pool.total_volume_deposited / 1_000_000_000);
+        msg!("   Total Volume Withdrawn: {} SOL", 
+             pool.total_volume_withdrawn / 1_000_000_000);
+        msg!("   Pool Efficiency: {:.2}%", 
+             if pool.total_deposits > 0 {
+                 (pool.total_withdrawals as f64 / pool.total_deposits as f64) * 100.0
+             } else {
+                 0.0
+             });
+        
         Ok(())
     }
 }
 
-pub fn h2_pattern(input: [u8; 32]) -> [u8; 32] {
-    const H2_DOMAIN: &[u8] = b"kuching";
-    let mut current = [H2_DOMAIN, &input[..]].concat();
-
-    current = keccak_hash(&current).to_bytes().to_vec();
-    current = sha256_hash(&current).to_bytes().to_vec();
-    current = keccak_hash(&current).to_bytes().to_vec();
-    current = sha256_hash(&current).to_bytes().to_vec();
-    current = keccak_hash(&current).to_bytes().to_vec();
-
+// Hash 함수 (필요한 것만 유지)
+pub fn h2_from_h1(h1: [u8; 32]) -> [u8; 32] {
+    let mut current = [COMMITMENT_DOMAIN, &h1[..]].concat();
+    
+    // 5단계 해싱
+    for _ in 0..5 {
+        current = if current.len() % 2 == 0 {
+            keccak_hash(&current).to_bytes().to_vec()
+        } else {
+            sha256_hash(&current).to_bytes().to_vec()
+        };
+    }
+    
     current.try_into().expect("Hash output should be 32 bytes")
 }
 
+// Account 구조체
+#[account]
+pub struct Pool {
+    pub total_deposits: u64,
+    pub total_withdrawals: u64,
+    pub active_commitments: u64,
+    pub total_volume_deposited: u64,   // 추가
+    pub total_volume_withdrawn: u64,   // 추가
+}
 
 #[account]
-pub struct BalanceAccount {
-    pub hash_key: [u8; 32],
+pub struct CommitmentAccount {
+    pub commitment: [u8; 32],
+    pub amount: u64,
+}
+
+#[account]
+pub struct NullifierAccount {
+    pub nullifier: [u8; 32],
+    pub used_at: i64,
+    pub amount_withdrawn: u64,  // 추가
 }
 
 #[derive(Accounts)]
-#[instruction(hash_key: [u8; 32])]
-pub struct Deposit<'info> {
+pub struct Initialize<'info> {
     #[account(
         init,
-        payer = user,
-        space = 8 + 32, 
-        seeds = [b"balance", hash_key.as_ref()],
+        payer = admin,
+        space = 8 + 40,
+        seeds = [b"pool"],
         bump
     )]
-    pub balance_account: Account<'info, BalanceAccount>,
+    pub pool: Account<'info, Pool>,
 
     #[account(mut)]
-    pub user: Signer<'info>,
+    pub admin: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(commitment: [u8; 32])]
+pub struct Deposit<'info> {
+    #[account(mut, seeds = [b"pool"], bump)]
+    pub pool: Account<'info, Pool>,
+
+    #[account(
+        init,
+        payer = depositor,
+        space = 8 + 32 + 8,
+        seeds = [b"commitment", commitment.as_ref()],
+        bump
+    )]
+    pub commitment_account: Account<'info, CommitmentAccount>,
+
+    #[account(mut)]
+    pub depositor: Signer<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 #[instruction(h1: [u8; 32])]
 pub struct Withdraw<'info> {
+    #[account(mut, seeds = [b"pool"], bump)]
+    pub pool: Account<'info, Pool>,
+
     #[account(
         mut,
-        close = user,
+        seeds = [b"commitment", commitment_account.commitment.as_ref()],
+        bump,
+        close = recipient  // ✅ recipient으로 변경
     )]
-    pub balance_account: Account<'info, BalanceAccount>,
+    pub commitment_account: Account<'info, CommitmentAccount>,
+
+    #[account(
+        init,
+        payer = user,
+        space = 8 + 32 + 8 + 8,  // ✅ 56 bytes로 수정
+        seeds = [b"nullifier", h1.as_ref()],
+        bump
+    )]
+    pub nullifier_account: Account<'info, NullifierAccount>,
+
+    /// CHECK: Recipient of withdrawn funds
+    #[account(mut)]
+    pub recipient: AccountInfo<'info>,
 
     #[account(mut)]
     pub user: Signer<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct GetStats<'info> {
+    #[account(seeds = [b"pool"], bump)]
+    pub pool: Account<'info, Pool>,
+}
+// 에러 코드 개선
 #[error_code]
-pub enum CustomError {
-    #[msg("Invalid amount. Must be greater than 0.")]
+pub enum ErrorCode {
+    #[msg("Invalid commitment - wrong H1 or commitment not found")]
+    InvalidCommitment,
+    
+    #[msg("Deposit amount must be greater than 0")]
     InvalidAmount,
-    #[msg("Invalid key — h1 does not match stored hash.")]
-    InvalidKey,
-    #[msg("No balance found.")]
-    NoBalance,
+    
+    #[msg("Minimum deposit is 0.001 SOL")]
+    AmountTooSmall,
+    
+    #[msg("This H1 has already been used")]
+    H1AlreadyUsed,
 }

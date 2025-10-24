@@ -16,8 +16,8 @@ pub mod anonymous_pool {
         pool.total_deposits = 0;
         pool.total_withdrawals = 0;
         pool.active_commitments = 0;
-        pool.total_volume_deposited = 0;  // 추가: 총 거래량
-        pool.total_volume_withdrawn = 0;  // 추가: 총 출금량
+        pool.total_volume_deposited = 0;
+        pool.total_volume_withdrawn = 0;
         
         msg!("✅ Pool initialized");
         Ok(())
@@ -28,22 +28,19 @@ pub mod anonymous_pool {
         commitment: [u8; 32],
         amount: u64,
     ) -> Result<()> {
-        // 검증 강화
         require!(amount > 0, ErrorCode::InvalidAmount);
         require!(amount >= MIN_DEPOSIT_AMOUNT, ErrorCode::AmountTooSmall);
 
         let pool = &mut ctx.accounts.pool;
         let commitment_account = &mut ctx.accounts.commitment_account;
 
-        // 계정 설정
         commitment_account.commitment = commitment;
         commitment_account.amount = amount;
-        // 통계 업데이트
+
         pool.total_deposits += 1;
         pool.active_commitments += 1;
-        pool.total_volume_deposited += amount;  // 추가
+        pool.total_volume_deposited += amount;
 
-        // SOL 전송
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
             &commitment_account.key(),
@@ -59,64 +56,53 @@ pub mod anonymous_pool {
         )?;
 
         msg!("✅ Deposit #{} complete", pool.total_deposits);
-        msg!("   Amount: {} lamports ({:.4} SOL)", 
-             amount, 
-             amount as f64 / 1_000_000_000.0);
+        msg!("   Amount: {} lamports ({:.4} SOL)", amount, amount as f64 / 1_000_000_000.0);
         msg!("   Commitment: {:?}", &commitment[0..8]);
         
         Ok(())
     }
 
-   pub fn withdraw(ctx: Context<Withdraw>, h1: [u8; 32]) -> Result<()> {
-    let pool = &mut ctx.accounts.pool;
-    let commitment_account = &ctx.accounts.commitment_account;
-    let nullifier_account = &mut ctx.accounts.nullifier_account;
+    pub fn withdraw(ctx: Context<Withdraw>, h1: [u8; 32]) -> Result<()> {
+        let pool = &mut ctx.accounts.pool;
+        let commitment_account = &ctx.accounts.commitment_account;
 
-    // H1 → H2 변환 및 검증
-    let computed_h2 = h2_from_h1(h1);
-    require!(
-        computed_h2 == commitment_account.commitment,
-        ErrorCode::InvalidCommitment
-    );
+        // H1 → H2 변환 및 검증
+        let computed_h2 = h2_from_h1(h1);
+        require!(
+            computed_h2 == commitment_account.commitment,
+            ErrorCode::InvalidCommitment
+        );
 
-    // 금액 저장
-    let withdraw_amount = commitment_account.amount;
+        let withdraw_amount = commitment_account.amount;
 
-    // Nullifier 기록
-    nullifier_account.nullifier = h1;
-    nullifier_account.amount_withdrawn = withdraw_amount;
-    nullifier_account.used_at = Clock::get()?.unix_timestamp;
+        // 계정의 전체 lamports 가져오기
+        let total_lamports = commitment_account.to_account_info().lamports();
 
-    // 계정의 전체 lamports 가져오기
-    let total_lamports = commitment_account.to_account_info().lamports();
-    
-    // SOL 전송
-    **commitment_account.to_account_info().try_borrow_mut_lamports()? = 0;
-    **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? += total_lamports;
+        // SOL 전송 및 commitment_account 닫기
+        **commitment_account.to_account_info().try_borrow_mut_lamports()? = 0;
+        **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? += total_lamports;
 
-    // 통계 업데이트
-    pool.total_withdrawals += 1;
-    pool.active_commitments = pool.active_commitments.saturating_sub(1);
-    pool.total_volume_withdrawn += withdraw_amount;  // ✅ amount 사용
+        // 통계 업데이트
+        pool.total_withdrawals += 1;
+        pool.active_commitments = pool.active_commitments.saturating_sub(1);
+        pool.total_volume_withdrawn += withdraw_amount;
 
-    msg!("💸 Withdrawal complete");
-    msg!("   Amount: {} lamports", withdraw_amount);
-    msg!("   Total received (with rent): {} lamports", total_lamports);
-    
-    Ok(())
-}
+        msg!("💸 Withdrawal complete");
+        msg!("   Amount: {} lamports", withdraw_amount);
+        msg!("   Total received (with rent): {} lamports", total_lamports);
+
+        Ok(())
+    }
 
     pub fn get_pool_stats(ctx: Context<GetStats>) -> Result<()> {
         let pool = &ctx.accounts.pool;
-        
+
         msg!("📊 Pool Statistics:");
         msg!("   Total Deposits: {}", pool.total_deposits);
         msg!("   Total Withdrawals: {}", pool.total_withdrawals);
         msg!("   Active Commitments: {}", pool.active_commitments);
-        msg!("   Total Volume Deposited: {} SOL", 
-             pool.total_volume_deposited / 1_000_000_000);
-        msg!("   Total Volume Withdrawn: {} SOL", 
-             pool.total_volume_withdrawn / 1_000_000_000);
+        msg!("   Total Volume Deposited: {} SOL", pool.total_volume_deposited / 1_000_000_000);
+        msg!("   Total Volume Withdrawn: {} SOL", pool.total_volume_withdrawn / 1_000_000_000);
         msg!("   Pool Efficiency: {:.2}%", 
              if pool.total_deposits > 0 {
                  (pool.total_withdrawals as f64 / pool.total_deposits as f64) * 100.0
@@ -128,11 +114,9 @@ pub mod anonymous_pool {
     }
 }
 
-// Hash 함수 (필요한 것만 유지)
+// Hash 함수
 pub fn h2_from_h1(h1: [u8; 32]) -> [u8; 32] {
     let mut current = [COMMITMENT_DOMAIN, &h1[..]].concat();
-    
-    // 5단계 해싱
     for _ in 0..5 {
         current = if current.len() % 2 == 0 {
             keccak_hash(&current).to_bytes().to_vec()
@@ -140,7 +124,6 @@ pub fn h2_from_h1(h1: [u8; 32]) -> [u8; 32] {
             sha256_hash(&current).to_bytes().to_vec()
         };
     }
-    
     current.try_into().expect("Hash output should be 32 bytes")
 }
 
@@ -150,8 +133,8 @@ pub struct Pool {
     pub total_deposits: u64,
     pub total_withdrawals: u64,
     pub active_commitments: u64,
-    pub total_volume_deposited: u64,   // 추가
-    pub total_volume_withdrawn: u64,   // 추가
+    pub total_volume_deposited: u64,
+    pub total_volume_withdrawn: u64,
 }
 
 #[account]
@@ -160,27 +143,12 @@ pub struct CommitmentAccount {
     pub amount: u64,
 }
 
-#[account]
-pub struct NullifierAccount {
-    pub nullifier: [u8; 32],
-    pub used_at: i64,
-    pub amount_withdrawn: u64,  // 추가
-}
-
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(
-        init,
-        payer = admin,
-        space = 8 + 40,
-        seeds = [b"pool"],
-        bump
-    )]
+    #[account(init, payer = admin, space = 8 + 40, seeds = [b"pool"], bump)]
     pub pool: Account<'info, Pool>,
-
     #[account(mut)]
     pub admin: Signer<'info>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -189,19 +157,10 @@ pub struct Initialize<'info> {
 pub struct Deposit<'info> {
     #[account(mut, seeds = [b"pool"], bump)]
     pub pool: Account<'info, Pool>,
-
-    #[account(
-        init,
-        payer = depositor,
-        space = 8 + 32 + 8,
-        seeds = [b"commitment", commitment.as_ref()],
-        bump
-    )]
+    #[account(init, payer = depositor, space = 8 + 32 + 8, seeds = [b"commitment", commitment.as_ref()], bump)]
     pub commitment_account: Account<'info, CommitmentAccount>,
-
     #[account(mut)]
     pub depositor: Signer<'info>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -210,31 +169,13 @@ pub struct Deposit<'info> {
 pub struct Withdraw<'info> {
     #[account(mut, seeds = [b"pool"], bump)]
     pub pool: Account<'info, Pool>,
-
-    #[account(
-        mut,
-        seeds = [b"commitment", commitment_account.commitment.as_ref()],
-        bump,
-        close = recipient  // ✅ recipient으로 변경
-    )]
+    #[account(mut, seeds = [b"commitment", commitment_account.commitment.as_ref()], bump, close = recipient)]
     pub commitment_account: Account<'info, CommitmentAccount>,
-
-    #[account(
-        init,
-        payer = user,
-        space = 8 + 32 + 8 + 8,  // ✅ 56 bytes로 수정
-        seeds = [b"nullifier", h1.as_ref()],
-        bump
-    )]
-    pub nullifier_account: Account<'info, NullifierAccount>,
-
     /// CHECK: Recipient of withdrawn funds
     #[account(mut)]
     pub recipient: AccountInfo<'info>,
-
     #[account(mut)]
     pub user: Signer<'info>,
-
     pub system_program: Program<'info, System>,
 }
 
@@ -243,18 +184,13 @@ pub struct GetStats<'info> {
     #[account(seeds = [b"pool"], bump)]
     pub pool: Account<'info, Pool>,
 }
-// 에러 코드 개선
+
 #[error_code]
 pub enum ErrorCode {
     #[msg("Invalid commitment - wrong H1 or commitment not found")]
     InvalidCommitment,
-    
     #[msg("Deposit amount must be greater than 0")]
     InvalidAmount,
-    
     #[msg("Minimum deposit is 0.001 SOL")]
     AmountTooSmall,
-    
-    #[msg("This H1 has already been used")]
-    H1AlreadyUsed,
 }

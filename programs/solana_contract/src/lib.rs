@@ -12,104 +12,62 @@ pub mod anonymous_pool {
     use super::*;
 
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        pool.total_deposits = 0;
-        pool.total_withdrawals = 0;
-        pool.active_commitments = 0;
-        pool.total_volume_deposited = 0;
-        pool.total_volume_withdrawn = 0;
-        
-        msg!("✅ Pool initialized");
+        let vault = &mut ctx.accounts.pool_vault;
+        vault.total_volume = 0;
+
+        msg!("✅ PoolVault initialized");
         Ok(())
     }
 
-    pub fn deposit(
-        ctx: Context<Deposit>,
-        commitment: [u8; 32],
-        amount: u64,
-    ) -> Result<()> {
-        require!(amount > 0, ErrorCode::InvalidAmount);
+    pub fn deposit(ctx: Context<Deposit>, commitment: [u8; 32], amount: u64) -> Result<()> {
         require!(amount >= MIN_DEPOSIT_AMOUNT, ErrorCode::AmountTooSmall);
 
-        let pool = &mut ctx.accounts.pool;
+        let vault = &mut ctx.accounts.pool_vault;
         let commitment_account = &mut ctx.accounts.commitment_account;
 
+        // Commitment metadata 설정
         commitment_account.commitment = commitment;
         commitment_account.amount = amount;
 
-        pool.total_deposits += 1;
-        pool.active_commitments += 1;
-        pool.total_volume_deposited += amount;
-
+        // Deposit SOL → Vault PDA
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
-            &commitment_account.key(),
+            &vault.key(),
             amount,
         );
-
         anchor_lang::solana_program::program::invoke(
             &ix,
-            &[
-                ctx.accounts.depositor.to_account_info(),
-                commitment_account.to_account_info(),
-            ],
+            &[ctx.accounts.depositor.to_account_info(), vault.to_account_info()],
         )?;
 
-        msg!("✅ Deposit #{} complete", pool.total_deposits);
-        msg!("   Amount: {} lamports ({:.4} SOL)", amount, amount as f64 / 1_000_000_000.0);
-        msg!("   Commitment: {:?}", &commitment[0..8]);
-        
+        vault.total_volume = vault.total_volume.saturating_add(amount);
+
+        msg!("✅ Deposit complete: {} lamports", amount);
         Ok(())
     }
 
     pub fn withdraw(ctx: Context<Withdraw>, h1: [u8; 32]) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
+        let vault = &mut ctx.accounts.pool_vault;
         let commitment_account = &ctx.accounts.commitment_account;
 
-        // H1 → H2 변환 및 검증
         let computed_h2 = h2_from_h1(h1);
-        require!(
-            computed_h2 == commitment_account.commitment,
-            ErrorCode::InvalidCommitment
-        );
+        require!(computed_h2 == commitment_account.commitment, ErrorCode::InvalidCommitment);
 
-        let withdraw_amount = commitment_account.amount;
+        let amount = commitment_account.amount;
 
-        // 계정의 전체 lamports 가져오기
-        let total_lamports = commitment_account.to_account_info().lamports();
+        // Vault → recipient
+        **vault.to_account_info().try_borrow_mut_lamports()? -= amount;
+        **ctx.accounts.recipient.try_borrow_mut_lamports()? += amount;
 
-        // SOL 전송 및 commitment_account 닫기
-        **commitment_account.to_account_info().try_borrow_mut_lamports()? = 0;
-        **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? += total_lamports;
+        vault.total_volume = vault.total_volume.saturating_sub(amount);
 
-        // 통계 업데이트
-        pool.total_withdrawals += 1;
-        pool.active_commitments = pool.active_commitments.saturating_sub(1);
-        pool.total_volume_withdrawn += withdraw_amount;
-
-        msg!("💸 Withdrawal complete");
-        msg!("   Amount: {} lamports", withdraw_amount);
-        msg!("   Total received (with rent): {} lamports", total_lamports);
-
+        msg!("💸 Withdrawal complete: {} lamports", amount);
         Ok(())
     }
 
     pub fn get_pool_stats(ctx: Context<GetStats>) -> Result<()> {
-        let pool = &ctx.accounts.pool;
-
-        msg!("📊 Pool Statistics:");
-        msg!("   Total Deposits: {}", pool.total_deposits);
-        msg!("   Total Withdrawals: {}", pool.total_withdrawals);
-        msg!("   Active Commitments: {}", pool.active_commitments);
-        msg!("   Total Volume Deposited: {} SOL", pool.total_volume_deposited / 1_000_000_000);
-        msg!("   Total Volume Withdrawn: {} SOL", pool.total_volume_withdrawn / 1_000_000_000);
-        msg!("   Pool Efficiency: {:.2}%", 
-             if pool.total_deposits > 0 {
-                 (pool.total_withdrawals as f64 / pool.total_deposits as f64) * 100.0
-             } else {
-                 0.0
-             });
-        
+        let vault = &ctx.accounts.pool_vault;
+        msg!("📊 Vault total volume: {} lamports", vault.total_volume);
         Ok(())
     }
 }
@@ -127,26 +85,23 @@ pub fn h2_from_h1(h1: [u8; 32]) -> [u8; 32] {
     current.try_into().expect("Hash output should be 32 bytes")
 }
 
-// Account 구조체
+// Vault PDA 계정
 #[account]
-pub struct Pool {
-    pub total_deposits: u64,
-    pub total_withdrawals: u64,
-    pub active_commitments: u64,
-    pub total_volume_deposited: u64,
-    pub total_volume_withdrawn: u64,
+pub struct PoolVault {
+    pub total_volume: u64, // 모든 SOL 합계
 }
 
+// Commitment 계정 - 실제 SOL 없음
 #[account]
 pub struct CommitmentAccount {
     pub commitment: [u8; 32],
-    pub amount: u64,
+    pub amount: u64, // Vault에서 관리되는 금액
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = admin, space = 8 + 40, seeds = [b"pool"], bump)]
-    pub pool: Account<'info, Pool>,
+    #[account(init, payer = admin, space = 8 + 8, seeds = [b"pool_vault"], bump)]
+    pub pool_vault: Account<'info, PoolVault>,
     #[account(mut)]
     pub admin: Signer<'info>,
     pub system_program: Program<'info, System>,
@@ -155,8 +110,8 @@ pub struct Initialize<'info> {
 #[derive(Accounts)]
 #[instruction(commitment: [u8; 32])]
 pub struct Deposit<'info> {
-    #[account(mut, seeds = [b"pool"], bump)]
-    pub pool: Account<'info, Pool>,
+    #[account(mut, seeds = [b"pool_vault"], bump)]
+    pub pool_vault: Account<'info, PoolVault>,
     #[account(init, payer = depositor, space = 8 + 32 + 8, seeds = [b"commitment", commitment.as_ref()], bump)]
     pub commitment_account: Account<'info, CommitmentAccount>,
     #[account(mut)]
@@ -167,8 +122,8 @@ pub struct Deposit<'info> {
 #[derive(Accounts)]
 #[instruction(h1: [u8; 32])]
 pub struct Withdraw<'info> {
-    #[account(mut, seeds = [b"pool"], bump)]
-    pub pool: Account<'info, Pool>,
+    #[account(mut, seeds = [b"pool_vault"], bump)]
+    pub pool_vault: Account<'info, PoolVault>,
     #[account(mut, seeds = [b"commitment", commitment_account.commitment.as_ref()], bump, close = recipient)]
     pub commitment_account: Account<'info, CommitmentAccount>,
     /// CHECK: Recipient of withdrawn funds
@@ -181,8 +136,8 @@ pub struct Withdraw<'info> {
 
 #[derive(Accounts)]
 pub struct GetStats<'info> {
-    #[account(seeds = [b"pool"], bump)]
-    pub pool: Account<'info, Pool>,
+    #[account(seeds = [b"pool_vault"], bump)]
+    pub pool_vault: Account<'info, PoolVault>,
 }
 
 #[error_code]

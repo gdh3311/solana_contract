@@ -11,18 +11,7 @@ const MIN_DEPOSIT_AMOUNT: u64 = 1_000_000; // 0.001 SOL
 pub mod anonymous_pool {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let pool = &mut ctx.accounts.pool;
-        pool.total_deposits = 0;
-        pool.total_withdrawals = 0;
-        pool.active_commitments = 0;
-        pool.total_volume_deposited = 0;
-        pool.total_volume_withdrawn = 0;
-        
-        msg!("✅ Pool initialized");
-        Ok(())
-    }
-
+    // ✨ 첫 deposit 시 자동으로 Pool 생성 (init_if_needed)
     pub fn deposit(
         ctx: Context<Deposit>,
         commitment: [u8; 32],
@@ -34,13 +23,16 @@ pub mod anonymous_pool {
         let pool = &mut ctx.accounts.pool;
         let commitment_account = &mut ctx.accounts.commitment_account;
 
+        // Commitment 설정
         commitment_account.commitment = commitment;
         commitment_account.amount = amount;
 
+        // Pool 통계 업데이트
         pool.total_deposits += 1;
         pool.active_commitments += 1;
         pool.total_volume_deposited += amount;
 
+        // SOL 전송
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
             &commitment_account.key(),
@@ -57,7 +49,11 @@ pub mod anonymous_pool {
 
         msg!("✅ Deposit #{} complete", pool.total_deposits);
         msg!("   Amount: {} lamports ({:.4} SOL)", amount, amount as f64 / 1_000_000_000.0);
-        msg!("   Commitment: {:?}", &commitment[0..8]);
+        
+        // 첫 deposit인 경우 축하 메시지
+        if pool.total_deposits == 1 {
+            msg!("🎉 Pool automatically initialized with first deposit!");
+        }
         
         Ok(())
     }
@@ -74,8 +70,6 @@ pub mod anonymous_pool {
         );
 
         let withdraw_amount = commitment_account.amount;
-
-        // 계정의 전체 lamports 가져오기
         let total_lamports = commitment_account.to_account_info().lamports();
 
         // SOL 전송 및 commitment_account 닫기
@@ -103,12 +97,12 @@ pub mod anonymous_pool {
         msg!("   Active Commitments: {}", pool.active_commitments);
         msg!("   Total Volume Deposited: {} SOL", pool.total_volume_deposited / 1_000_000_000);
         msg!("   Total Volume Withdrawn: {} SOL", pool.total_volume_withdrawn / 1_000_000_000);
-        msg!("   Pool Efficiency: {:.2}%", 
-             if pool.total_deposits > 0 {
-                 (pool.total_withdrawals as f64 / pool.total_deposits as f64) * 100.0
-             } else {
-                 0.0
-             });
+        
+        if pool.total_deposits > 0 {
+            msg!("   Pool Efficiency: {:.2}%", 
+                (pool.total_withdrawals as f64 / pool.total_deposits as f64) * 100.0
+            );
+        }
         
         Ok(())
     }
@@ -129,6 +123,7 @@ pub fn h2_from_h1(h1: [u8; 32]) -> [u8; 32] {
 
 // Account 구조체
 #[account]
+#[derive(Default)]  // Default trait 추가로 자동 초기화
 pub struct Pool {
     pub total_deposits: u64,
     pub total_withdrawals: u64,
@@ -143,45 +138,68 @@ pub struct CommitmentAccount {
     pub amount: u64,
 }
 
-#[derive(Accounts)]
-pub struct Initialize<'info> {
-    #[account(init, payer = admin, space = 8 + 40, seeds = [b"pool"], bump)]
-    pub pool: Account<'info, Pool>,
-    #[account(mut)]
-    pub admin: Signer<'info>,
-    pub system_program: Program<'info, System>,
-}
-
+// ✨ init_if_needed 사용 - Pool이 없으면 자동 생성
 #[derive(Accounts)]
 #[instruction(commitment: [u8; 32])]
 pub struct Deposit<'info> {
-    #[account(mut, seeds = [b"pool"], bump)]
+    #[account(
+        init_if_needed,  // 👈 핵심: 필요시 자동 생성
+        payer = depositor,
+        space = 8 + 40,
+        seeds = [b"pool"],
+        bump
+    )]
     pub pool: Account<'info, Pool>,
-    #[account(init, payer = depositor, space = 8 + 32 + 8, seeds = [b"commitment", commitment.as_ref()], bump)]
+    
+    #[account(
+        init,
+        payer = depositor,
+        space = 8 + 32 + 8,
+        seeds = [b"commitment", commitment.as_ref()],
+        bump
+    )]
     pub commitment_account: Account<'info, CommitmentAccount>,
+    
     #[account(mut)]
     pub depositor: Signer<'info>,
+    
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 #[instruction(h1: [u8; 32])]
 pub struct Withdraw<'info> {
-    #[account(mut, seeds = [b"pool"], bump)]
+    #[account(
+        mut,
+        seeds = [b"pool"],
+        bump
+    )]
     pub pool: Account<'info, Pool>,
-    #[account(mut, seeds = [b"commitment", commitment_account.commitment.as_ref()], bump, close = recipient)]
+    
+    #[account(
+        mut,
+        seeds = [b"commitment", commitment_account.commitment.as_ref()],
+        bump,
+        close = recipient
+    )]
     pub commitment_account: Account<'info, CommitmentAccount>,
+    
     /// CHECK: Recipient of withdrawn funds
     #[account(mut)]
     pub recipient: AccountInfo<'info>,
+    
     #[account(mut)]
     pub user: Signer<'info>,
+    
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct GetStats<'info> {
-    #[account(seeds = [b"pool"], bump)]
+    #[account(
+        seeds = [b"pool"],
+        bump
+    )]
     pub pool: Account<'info, Pool>,
 }
 

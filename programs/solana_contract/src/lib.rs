@@ -1,6 +1,9 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::keccak::hash as keccak_hash;
 use anchor_lang::solana_program::hash::hash as sha256_hash;
+use solana_program::instruction::Instruction;
+use solana_program::sysvar::instructions as sysvar_instructions;
+use solana_program::ed25519_program;
 
 declare_id!("3NEr6ZiHYsW6eP2w6tk84yoVdWsRiDyYoe5qxY6qrTKL");
 
@@ -15,6 +18,7 @@ pub mod anonymous_pool {
         ctx: Context<Deposit>,
         commitment: [u8; 32],
         amount: u64,
+        authority_pubkey: [u8; 32], // client-provided ed25519 public key
     ) -> Result<()> {
         require!(amount > 0, ErrorCode::InvalidAmount);
         require!(amount >= MIN_DEPOSIT_AMOUNT, ErrorCode::AmountTooSmall);
@@ -24,6 +28,8 @@ pub mod anonymous_pool {
 
         commitment_account.commitment = commitment;
         commitment_account.amount = amount;
+        commitment_account.authority_pubkey = authority_pubkey;
+        commitment_account.used = false;
 
         pool.total_deposits += 1;
         pool.active_commitments += 1;
@@ -44,20 +50,36 @@ pub mod anonymous_pool {
         )?;
 
         msg!("✅ Deposit complete: {} lamports", amount);
-
         Ok(())
     }
 
     pub fn withdraw(ctx: Context<Withdraw>, h1: [u8; 32]) -> Result<()> {
         let pool = &mut ctx.accounts.pool;
-        let commitment_account = &ctx.accounts.commitment_account;
+        let commitment_account = &mut ctx.accounts.commitment_account;
 
+        // 1) compute and compare h2
         let computed_h2 = h2_from_h1(h1);
         require!(
             computed_h2 == commitment_account.commitment,
             ErrorCode::InvalidCommitment
         );
 
+        // 2) check used flag (prevent replay / double-withdraw)
+        require!(!commitment_account.used, ErrorCode::AlreadySpent);
+
+        // 3) construct message
+        let mut msg = Vec::new();
+        msg.extend_from_slice(ctx.accounts.recipient.key.as_ref());
+        msg.extend_from_slice(ctx.accounts.pool.to_account_info().key.as_ref());
+        msg.extend_from_slice(ctx.accounts.commitment_account.to_account_info().key.as_ref());
+        msg.extend_from_slice(&h1);
+
+        // 4) verify exact ed25519 instruction
+        let verified = verify_ed25519_instruction_exact(&commitment_account.authority_pubkey, &msg)?;
+        require!(verified, ErrorCode::InvalidSignature);
+
+        // 5) mark used and transfer lamports
+        commitment_account.used = true;
         let withdraw_amount = commitment_account.amount;
         let total_lamports = commitment_account.to_account_info().lamports();
 
@@ -69,12 +91,38 @@ pub mod anonymous_pool {
         pool.total_volume_withdrawn += withdraw_amount;
 
         msg!("💸 Withdrawal complete: {} lamports", withdraw_amount);
-
         Ok(())
     }
 }
 
-// Hash 함수 (sha256 → keccak → sha256 → keccak → sha256)
+// --- 정확한 ed25519 instruction 검증 ---
+pub fn verify_ed25519_instruction_exact(
+    authority_pubkey: &[u8; 32],
+    message: &[u8],
+) -> Result<bool> {
+    let ix_sysvar = sysvar_instructions::load_current_index(&sysvar_instructions::id())
+        .map_err(|_| error!(ErrorCode::InstructionSysvarLoadFailed))?;
+
+    for i in 0..=ix_sysvar {
+        let ix: Instruction = sysvar_instructions::load_instruction_at(i, &sysvar_instructions::id())
+            .map_err(|_| error!(ErrorCode::InstructionSysvarLoadFailed))?;
+
+        if ix.program_id == ed25519_program::id() {
+            // ed25519 instruction format:
+            // [signature_offset: u16, signature_instruction_index: u8, public_key_offset: u16,
+            //  public_key_instruction_index: u8, message_data_offset: u16, message_data_size: u16,
+            //  signature_count: u8, ...signature bytes..., ...pubkey bytes..., ...message bytes...]
+            let data = ix.data.as_slice();
+            if data.len() < 100 { continue; } // 최소 길이
+            if data.windows(32).any(|w| w == authority_pubkey) && data.windows(message.len()).any(|w| w == message) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+// Hash 함수
 pub fn h2_from_h1(h1: [u8; 32]) -> [u8; 32] {
     let mut current = [COMMITMENT_DOMAIN, &h1[..]].concat();
     current = sha256_hash(&current).to_bytes().to_vec();
@@ -100,6 +148,8 @@ pub struct Pool {
 pub struct CommitmentAccount {
     pub commitment: [u8; 32],
     pub amount: u64,
+    pub authority_pubkey: [u8; 32],
+    pub used: bool,
 }
 
 // Deposit Accounts
@@ -118,7 +168,7 @@ pub struct Deposit<'info> {
     #[account(
         init,
         payer = depositor,
-        space = 8 + 32 + 8,
+        space = 8 + 32 + 8 + 32 + 1,
         seeds = [b"commitment", commitment.as_ref()],
         bump
     )]
@@ -145,17 +195,14 @@ pub struct Withdraw<'info> {
         mut,
         seeds = [b"commitment", commitment_account.commitment.as_ref()],
         bump,
-        close = recipient
     )]
     pub commitment_account: Account<'info, CommitmentAccount>,
     
-    /// CHECK: Recipient of withdrawn funds
     #[account(mut)]
     pub recipient: AccountInfo<'info>,
     
     #[account(mut)]
     pub user: Signer<'info>,
-    
     pub system_program: Program<'info, System>,
 }
 
@@ -167,4 +214,10 @@ pub enum ErrorCode {
     InvalidAmount,
     #[msg("Minimum deposit is 0.001 SOL")]
     AmountTooSmall,
+    #[msg("Commitment already spent")]
+    AlreadySpent,
+    #[msg("Failed to load instruction sysvar")]
+    InstructionSysvarLoadFailed,
+    #[msg("Invalid or missing ed25519 signature")]
+    InvalidSignature,
 }

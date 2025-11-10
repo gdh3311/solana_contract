@@ -61,28 +61,21 @@ pub mod anonymous_pool {
         let acct = &mut ctx.accounts.commitment_account;
         let withdraw_state = &mut ctx.accounts.withdraw_state;
 
-        // 1) Withdraw Commitment 검증
-        let computed_withdraw_commitment = compute_withdraw_commitment(&h1, &recipient, &salt);
+        let computed_h2 = h2_from_h1(h1);
+        require!(computed_h2 == acct.commitment, ErrorCode::InvalidCommitment);
+
+        let computed_withdraw_commitment = compute_withdraw_commitment(&computed_h2, &recipient, &salt);
         require!(
             computed_withdraw_commitment == withdraw_state.withdraw_commitment,
             ErrorCode::InvalidReveal
         );
 
-        // 2) 이미 reveal 되었는지 확인
         require!(!withdraw_state.revealed, ErrorCode::AlreadyRevealed);
-
-        // 3) h2 검증
-        let computed_h2 = h2_from_h1(h1);
-        require!(computed_h2 == acct.commitment, ErrorCode::InvalidCommitment);
-
-        // 4) 이중 출금 방지
         require!(!acct.withdrawn, ErrorCode::AlreadyWithdrawn);
 
-        // 상태 변경
         acct.withdrawn = true;
         withdraw_state.revealed = true;
 
-        // 5) 출금 - recipient에게 전송!
         let total = acct.to_account_info().lamports();
         **acct.to_account_info().try_borrow_mut_lamports()? = 0;
         **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? += total;
@@ -92,9 +85,9 @@ pub mod anonymous_pool {
     }
 }
 
-fn compute_withdraw_commitment(h1: &[u8; 32], recipient: &Pubkey, salt: &[u8; 32]) -> [u8; 32] {
+fn compute_withdraw_commitment(h2: &[u8; 32], recipient: &Pubkey, salt: &[u8; 32]) -> [u8; 32] {
     let mut buf = Vec::with_capacity(96);
-    buf.extend_from_slice(h1);
+    buf.extend_from_slice(h2);
     buf.extend_from_slice(recipient.as_ref());
     buf.extend_from_slice(salt);
     keccak_hash(&buf).to_bytes()
@@ -151,8 +144,10 @@ pub struct Deposit<'info> {
 #[derive(Accounts)]
 #[instruction(withdraw_commitment: [u8; 32])]
 pub struct WithdrawCommit<'info> {
-    /// CHECK: CommitmentAccount 존재 확인
-    pub commitment_account: AccountInfo<'info>,
+    #[account(
+        constraint = !commitment_account.withdrawn @ ErrorCode::AlreadyWithdrawn
+    )]
+    pub commitment_account: Account<'info, CommitmentAccount>,
 
     #[account(
         init,
@@ -168,31 +163,26 @@ pub struct WithdrawCommit<'info> {
 
     pub system_program: Program<'info, System>,
 }
-
 #[derive(Accounts)]
 pub struct WithdrawReveal<'info> {
     #[account(
         mut,
         seeds = [b"commitment", commitment_account.commitment.as_ref()],
         bump,
-        close = recipient  // ← recipient에게 rent 반환
+        close = recipient
     )]
     pub commitment_account: Account<'info, CommitmentAccount>,
 
     #[account(
         mut,
-        seeds = [b"withdraw", withdraw_state.withdraw_commitment.as_ref()],  // ← 쉼표 추가!
+        seeds = [b"withdraw", withdraw_state.withdraw_commitment.as_ref()],
         bump,
-        close = recipient  // ← recipient에게 rent 반환
+        close = recipient
     )]
     pub withdraw_state: Account<'info, WithdrawState>,
 
-    /// CHECK: h1을 아는 사람이 지정한 출금 주소
     #[account(mut)]
-    pub recipient: AccountInfo<'info>,
-
-    #[account(mut)]
-    pub fee_payer: Signer<'info>,  // ← 트랜잭션 수수료 지불자
+    pub recipient: Signer<'info>, 
 
     pub system_program: Program<'info, System>,
 }

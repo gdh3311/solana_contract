@@ -21,8 +21,8 @@ pub mod anonymous_pool {
 
         let acct = &mut ctx.accounts.commitment_account;
         acct.commitment = commitment;
-        acct.amount = amount;
-        acct.withdrawn = false;
+        acct.deposited_amount = amount;
+        acct.withdrawn_amount = 0;
 
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
@@ -42,10 +42,18 @@ pub mod anonymous_pool {
         ctx: Context<WithdrawCommit>,
         withdraw_commitment: [u8; 32],
     ) -> Result<()> {
+        let commitment_account = &ctx.accounts.commitment_account;
         let withdraw_state = &mut ctx.accounts.withdraw_state;
         
+        // Check remaining balance
+        let remaining = commitment_account
+            .deposited_amount
+            .checked_sub(commitment_account.withdrawn_amount)
+            .ok_or(ErrorCode::InsufficientBalance)?;
+        require!(remaining > 0, ErrorCode::InsufficientBalance);
+        
         withdraw_state.withdraw_commitment = withdraw_commitment;
-        withdraw_state.commitment_account = ctx.accounts.commitment_account.key();
+        withdraw_state.commitment_account = commitment_account.key();
         withdraw_state.revealed = false;
 
         msg!("🔒 Withdraw committed");
@@ -57,39 +65,80 @@ pub mod anonymous_pool {
         h1: [u8; 32],
         recipient: Pubkey,
         salt: [u8; 32],
+        amount: u64,
     ) -> Result<()> {
         let acct = &mut ctx.accounts.commitment_account;
         let withdraw_state = &mut ctx.accounts.withdraw_state;
 
+        // Validation 1: h1 → h2
         let computed_h2 = h2_from_h1(h1);
         require!(computed_h2 == acct.commitment, ErrorCode::InvalidCommitment);
 
-        let computed_withdraw_commitment = compute_withdraw_commitment(&computed_h2, &recipient, &salt);
+        // Validation 2: withdraw_commitment
+        let computed_withdraw_commitment = compute_withdraw_commitment(&computed_h2, &recipient, &salt, amount);
         require!(
             computed_withdraw_commitment == withdraw_state.withdraw_commitment,
             ErrorCode::InvalidReveal
         );
 
+        // Validation 3: already revealed
         require!(!withdraw_state.revealed, ErrorCode::AlreadyRevealed);
-        require!(!acct.withdrawn, ErrorCode::AlreadyWithdrawn);
 
-        acct.withdrawn = true;
+        // Validation 4: check balance
+        let remaining = acct
+            .deposited_amount
+            .checked_sub(acct.withdrawn_amount)
+            .ok_or(ErrorCode::InsufficientBalance)?;
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        require!(amount <= remaining, ErrorCode::InsufficientBalance);
+
+        // Calculate actual withdrawal amount
+        // If this is the last withdrawal, withdraw everything including any dust
+        let actual_amount = if amount == remaining {
+            // Last withdrawal - take all remaining lamports
+            let pda_balance = acct.to_account_info().lamports();
+            pda_balance
+        } else {
+            // Partial withdrawal - respect the requested amount
+            let pda_balance = acct.to_account_info().lamports();
+            let rent_exempt = Rent::get()?.minimum_balance(CommitmentAccount::LEN);
+            let available = pda_balance.checked_sub(rent_exempt).unwrap_or(0);
+            
+            require!(amount <= available, ErrorCode::InsufficientBalance);
+            amount
+        };
+
+        // Update state
+        acct.withdrawn_amount = acct
+            .withdrawn_amount
+            .checked_add(amount)
+            .ok_or(ErrorCode::Overflow)?;
         withdraw_state.revealed = true;
 
-        let total = acct.to_account_info().lamports();
-        **acct.to_account_info().try_borrow_mut_lamports()? = 0;
-        **ctx.accounts.recipient.to_account_info().try_borrow_mut_lamports()? += total;
+        // Transfer to recipient
+        **acct.to_account_info().try_borrow_mut_lamports()? -= actual_amount;
+        **ctx.accounts.recipient.try_borrow_mut_lamports()? += actual_amount;
 
-        msg!("💸 withdraw: {} lamports → {}", total, recipient);
+        // Check if all funds withdrawn
+        if acct.withdrawn_amount >= acct.deposited_amount {
+            msg!("💸 withdraw: {} lamports → {} | 🗑️ Account closed (total: {})", 
+                amount, recipient, actual_amount);
+        } else {
+            msg!("💸 withdraw: {} lamports → {} (remaining: {})", 
+                amount, recipient, acct.deposited_amount - acct.withdrawn_amount);
+        }
+
         Ok(())
     }
+
 }
 
-fn compute_withdraw_commitment(h2: &[u8; 32], recipient: &Pubkey, salt: &[u8; 32]) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(96);
+fn compute_withdraw_commitment(h2: &[u8; 32], recipient: &Pubkey, salt: &[u8; 32], amount: u64) -> [u8; 32] {
+    let mut buf = Vec::with_capacity(96 + 8);
     buf.extend_from_slice(h2);
     buf.extend_from_slice(recipient.as_ref());
     buf.extend_from_slice(salt);
+    buf.extend_from_slice(&amount.to_le_bytes());
     keccak_hash(&buf).to_bytes()
 }
 
@@ -106,11 +155,11 @@ pub fn h2_from_h1(h1: [u8; 32]) -> [u8; 32] {
 #[account]
 pub struct CommitmentAccount {
     pub commitment: [u8; 32],
-    pub amount: u64,
-    pub withdrawn: bool,
+    pub deposited_amount: u64,
+    pub withdrawn_amount: u64,
 }
 impl CommitmentAccount {
-    pub const LEN: usize = 8 + 32 + 8 + 1;
+    pub const LEN: usize = 8 + 32 + 8 + 8;
 }
 
 #[account]
@@ -144,9 +193,6 @@ pub struct Deposit<'info> {
 #[derive(Accounts)]
 #[instruction(withdraw_commitment: [u8; 32])]
 pub struct WithdrawCommit<'info> {
-    #[account(
-        constraint = !commitment_account.withdrawn @ ErrorCode::AlreadyWithdrawn
-    )]
     pub commitment_account: Account<'info, CommitmentAccount>,
 
     #[account(
@@ -163,13 +209,13 @@ pub struct WithdrawCommit<'info> {
 
     pub system_program: Program<'info, System>,
 }
+
 #[derive(Accounts)]
 pub struct WithdrawReveal<'info> {
     #[account(
         mut,
         seeds = [b"commitment", commitment_account.commitment.as_ref()],
-        bump,
-        close = recipient
+        bump
     )]
     pub commitment_account: Account<'info, CommitmentAccount>,
 
@@ -201,4 +247,8 @@ pub enum ErrorCode {
     InvalidReveal,
     #[msg("Already revealed")]
     AlreadyRevealed,
+    #[msg("Insufficient balance")]
+    InsufficientBalance,
+    #[msg("Arithmetic overflow")]
+    Overflow,
 }

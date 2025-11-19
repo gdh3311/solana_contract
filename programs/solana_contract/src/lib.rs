@@ -60,77 +60,69 @@ pub mod anonymous_pool {
         Ok(())
     }
 
-    pub fn withdraw_reveal(
-        ctx: Context<WithdrawReveal>,
-        h1: [u8; 32],
-        recipient: Pubkey,
-        salt: [u8; 32],
-        amount: u64,
-    ) -> Result<()> {
-        let acct = &mut ctx.accounts.commitment_account;
-        let withdraw_state = &mut ctx.accounts.withdraw_state;
+ pub fn withdraw_reveal(
+    ctx: Context<WithdrawReveal>,
+    h1: [u8; 32],
+    recipient: Pubkey,
+    salt: [u8; 32],
+    amount: u64,
+) -> Result<()> {
+    let acct = &mut ctx.accounts.commitment_account;
+    let withdraw_state = &mut ctx.accounts.withdraw_state;
 
-        // Validation 1: h1 → h2
-        let computed_h2 = h2_from_h1(h1);
-        require!(computed_h2 == acct.commitment, ErrorCode::InvalidCommitment);
+    let computed_h2 = h2_from_h1(h1);
+    require!(computed_h2 == acct.commitment, ErrorCode::InvalidCommitment);
 
-        // Validation 2: withdraw_commitment
-        let computed_withdraw_commitment = compute_withdraw_commitment(&computed_h2, &recipient, &salt, amount);
-        require!(
-            computed_withdraw_commitment == withdraw_state.withdraw_commitment,
-            ErrorCode::InvalidReveal
-        );
+    let computed_withdraw_commitment =
+        compute_withdraw_commitment(&computed_h2, &recipient, &salt, amount);
+    require!(
+        computed_withdraw_commitment == withdraw_state.withdraw_commitment,
+        ErrorCode::InvalidReveal
+    );
 
-        // Validation 3: already revealed
-        require!(!withdraw_state.revealed, ErrorCode::AlreadyRevealed);
+    require!(!withdraw_state.revealed, ErrorCode::AlreadyRevealed);
 
-        // Validation 4: check balance
-        let remaining = acct
-            .deposited_amount
-            .checked_sub(acct.withdrawn_amount)
-            .ok_or(ErrorCode::InsufficientBalance)?;
-        require!(amount > 0, ErrorCode::InvalidAmount);
-        require!(amount <= remaining, ErrorCode::InsufficientBalance);
+    // 여기부터 수정됨 🔥
+    let remaining = acct
+        .deposited_amount
+        .checked_sub(acct.withdrawn_amount)
+        .ok_or(ErrorCode::InsufficientBalance)?;
 
-        // Calculate actual withdrawal amount
-        // If this is the last withdrawal, withdraw everything including any dust
-        let actual_amount = if amount == remaining {
-            // Last withdrawal - take all remaining lamports
-            let pda_balance = acct.to_account_info().lamports();
-            pda_balance
-        } else {
-            // Partial withdrawal - respect the requested amount
-            let pda_balance = acct.to_account_info().lamports();
-            let rent_exempt = Rent::get()?.minimum_balance(CommitmentAccount::LEN);
-            let available = pda_balance.checked_sub(rent_exempt).unwrap_or(0);
-            
-            require!(amount <= available, ErrorCode::InsufficientBalance);
-            amount
-        };
+    // 요청 금액이 remaining보다 크면 → remaining으로 자동 조정
+    let requested_amount = if amount > remaining {
+        remaining
+    } else {
+        amount
+    };
 
-        // Update state
-        acct.withdrawn_amount = acct
-            .withdrawn_amount
-            .checked_add(amount)
-            .ok_or(ErrorCode::Overflow)?;
-        withdraw_state.revealed = true;
+    require!(requested_amount > 0, ErrorCode::InvalidAmount);
 
-        // Transfer to recipient
-        **acct.to_account_info().try_borrow_mut_lamports()? -= actual_amount;
-        **ctx.accounts.recipient.try_borrow_mut_lamports()? += actual_amount;
+    // actual transfer amount 계산
+    let actual_amount = if requested_amount == remaining {
+        let pda_balance = acct.to_account_info().lamports();
+        pda_balance
+    } else {
+        let pda_balance = acct.to_account_info().lamports();
+        let rent_exempt = Rent::get()?.minimum_balance(CommitmentAccount::LEN);
+        let available = pda_balance.checked_sub(rent_exempt).unwrap_or(0);
+        
+        require!(requested_amount <= available, ErrorCode::InsufficientBalance);
+        requested_amount
+    };
 
-        // Check if all funds withdrawn
-        if acct.withdrawn_amount >= acct.deposited_amount {
-            msg!("💸 withdraw: {} lamports → {} | 🗑️ Account closed (total: {})", 
-                amount, recipient, actual_amount);
-        } else {
-            msg!("💸 withdraw: {} lamports → {} (remaining: {})", 
-                amount, recipient, acct.deposited_amount - acct.withdrawn_amount);
-        }
+    // 상태 업데이트: requested_amount 기준
+    acct.withdrawn_amount = acct
+        .withdrawn_amount
+        .checked_add(requested_amount)
+        .ok_or(ErrorCode::Overflow)?;
+    withdraw_state.revealed = true;
 
-        Ok(())
-    }
+    // Transfer
+    **acct.to_account_info().try_borrow_mut_lamports()? -= actual_amount;
+    **ctx.accounts.recipient.try_borrow_mut_lamports()? += actual_amount;
 
+    Ok(())
+}
 }
 
 fn compute_withdraw_commitment(h2: &[u8; 32], recipient: &Pubkey, salt: &[u8; 32], amount: u64) -> [u8; 32] {
@@ -188,13 +180,15 @@ pub struct Deposit<'info> {
     pub depositor: Signer<'info>,
 
     pub system_program: Program<'info, System>,
-}
+
+}   
 
 #[derive(Accounts)]
 #[instruction(withdraw_commitment: [u8; 32])]
 pub struct WithdrawCommit<'info> {
+    #[account(mut)]
     pub commitment_account: Account<'info, CommitmentAccount>,
-
+    
     #[account(
         init,
         payer = fee_payer,

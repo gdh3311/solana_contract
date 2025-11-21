@@ -37,7 +37,7 @@ pub mod solana_contract {
             &[ctx.accounts.depositor.to_account_info(), acct.to_account_info()],
         )?;
         
-        msg!("✅ Deposit: {} lamports, h2: {:?}", amount, commitment);
+        msg!("✅ Deposit: {} lamports", amount);
         Ok(())
     }
     
@@ -74,13 +74,10 @@ pub mod solana_contract {
     // Validate requested amount
     require!(amount > 0, ErrorCode::InvalidAmount);
     
-    // 🔥 전액 출금 로직: 요청 금액이 잔액 이상이면 전부 + rent 반환
     let (actual_amount, is_full_withdrawal) = if amount >= remaining {
-        // 전액 출금: PDA의 모든 lamports (잔액 + rent)
         let total_lamports = acct.to_account_info().lamports();
         (total_lamports, true)
     } else {
-        // 부분 출금: 요청한 만큼만
         (amount, false)
     };
     
@@ -94,14 +91,10 @@ pub mod solana_contract {
     **acct.to_account_info().try_borrow_mut_lamports()? -= actual_amount;
     **ctx.accounts.recipient.try_borrow_mut_lamports()? += actual_amount;
     
-    msg!("✅ ZKP Withdrawal: {} lamports", actual_amount);
-    msg!("   Deposited: {}, Withdrawn: {}, Remaining: {}", 
-         acct.deposited_amount, 
-         acct.withdrawn_amount,
-         acct.deposited_amount - acct.withdrawn_amount);
-    
     if is_full_withdrawal {
-        msg!("🔒 Full withdrawal - closing account and returning rent");
+        acct.commitment = [0; 32];
+        acct.deposited_amount = 0;
+        acct.withdrawn_amount = 0;
     }
     
     Ok(())
@@ -149,7 +142,6 @@ fn verify_ed25519_signature(
     let num_signatures = data[0];
     require!(num_signatures == 1, ErrorCode::InvalidEd25519InstructionData);
     
-    // ✅ 수정: 1-byte padding 기준으로 파싱
     // Header: [0]=num_sigs, [1]=padding, [2-15]=offsets
     let sig_offset = u16::from_le_bytes([data[2], data[3]]) as usize;
     let sig_ix_index = u16::from_le_bytes([data[4], data[5]]);
@@ -161,10 +153,6 @@ fn verify_ed25519_signature(
     let msg_size = u16::from_le_bytes([data[12], data[13]]) as usize;
     let msg_ix_index = u16::from_le_bytes([data[14], data[15]]);
     
-    msg!("Parsed Ed25519 instruction:");
-    msg!("  sig_ix_index: 0x{:04x}", sig_ix_index);
-    msg!("  pubkey_ix_index: 0x{:04x}", pubkey_ix_index);
-    msg!("  msg_ix_index: 0x{:04x}", msg_ix_index);
     
     // All data should be in the Ed25519 instruction itself
     require!(
@@ -199,17 +187,10 @@ fn verify_ed25519_signature(
         actual_message == expected_message,
         ErrorCode::MessageMismatch
     );
-    
-    msg!("✅ ZK Proof verified - signer knows H1 without revealing it!");
-    msg!("   H2 (pubkey): {:?}", expected_pubkey);
-    msg!("   Challenge: {:?}", expected_message);
+
     
     Ok(())
 }
-
-// ============================================================================
-// Account Structures
-// ============================================================================
 
 #[account]
 pub struct CommitmentAccount {
@@ -221,10 +202,6 @@ pub struct CommitmentAccount {
 impl CommitmentAccount {
     pub const LEN: usize = 8 + 32 + 8 + 8;
 }
-
-// ============================================================================
-// Account Contexts
-// ============================================================================
 
 #[derive(Accounts)]
 #[instruction(commitment: [u8; 32])]
@@ -263,10 +240,6 @@ pub struct WithdrawZKP<'info> {
     
     pub system_program: Program<'info, System>,
 }
-
-// ============================================================================
-// Error Codes
-// ============================================================================
 
 #[error_code]
 pub enum ErrorCode {
@@ -309,59 +282,3 @@ pub enum ErrorCode {
     #[msg("Invalid message size")]
     InvalidMessageSize,
 }
-
-
-// challenge = hash(H2 + recipient + nonce + amount)
-//          = hash([공개] + [공개] + [공개] + [공개])
-// ```
-
-// **모든 입력값이 공개 정보!**
-// - H2: 공개 (온체인에 저장)
-// - recipient: 공개 (트랜잭션에 명시)
-// - nonce: 공개 (트랜잭션에 명시)
-// - amount: 공개 (트랜잭션에 명시)
-
-// **Challenge도 공개 정보!** (Ed25519 instruction의 message에 포함)
-
-// ### 3. 비밀은 **서명**에 있음
-// ```
-// signature = sign(H1, challenge)
-//               ↑
-//            비밀키!
-// ```
-
-// **보안의 핵심:**
-// - **H1 (비밀키)을 알아야만** 유효한 서명 생성 가능
-// - Nonce, challenge를 알아도 **H1 없이는 서명 불가능**
-
-// ## 공격 시나리오 분석
-
-// ### 공격 1: C가 B의 nonce를 그대로 사용
-// ```
-// C가 시도:
-// challenge_C = hash(H2 + C_address + nonce_B + 0.25)
-// signature_C = sign(H1, challenge_C)
-// ```
-
-// **결과: ✅ 성공!**
-
-// **하지만 문제없는 이유:**
-// - C는 H1을 원래 알고 있음 (A가 줬으니까)
-// - C는 **자기 몫(0.25)**만 출금
-// - B의 몫(0.5)은 여전히 안전
-// ```
-// 실행 순서:
-// 1. C가 B의 nonce 사용해서 0.25 출금 → 성공
-// 2. B가 자기 nonce 사용해서 0.5 출금 → 성공
-// ```
-
-// **왜 안전?** Challenge에 **recipient와 amount가 포함**되어 있어서!
-
-// ### 공격 2: C가 B의 서명을 복사
-// ```
-// C가 B의 트랜잭션에서 복사:
-// - signature_B
-// - nonce_B
-// - amount: 0.5
-
-// C가 recipient만 자기 주소로 바꿔서 실행 시도

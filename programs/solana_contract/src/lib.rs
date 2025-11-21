@@ -43,74 +43,69 @@ pub mod solana_contract {
     
     /// Direct withdrawal using ZK proof (no commit-reveal needed)
     /// H1 is NEVER exposed on-chain!
-    pub fn withdraw_zkp(
-        ctx: Context<WithdrawZKP>,
-        nonce: [u8; 32],
-        amount: u64,
-    ) -> Result<()> {
-        let acct = &mut ctx.accounts.commitment_account;
-        let expected_h2 = acct.commitment;
-        
-        // Create challenge message = hash(h2 + recipient + nonce + amount)
-        let challenge = create_withdrawal_challenge(
-            &expected_h2,
-            &ctx.accounts.recipient.key(),
-            &nonce,
-            amount,
-        );
-        
-        // Verify the Ed25519 signature
-        // Ed25519 프로그램이 이미 서명을 검증했는지 확인
-        // instruction 0번에 Ed25519Verify가 있어야 함
-        verify_ed25519_signature(
-            &ctx.accounts.ix_sysvar,
-            &expected_h2,
-            &challenge,
-        )?;
-        
-        // Calculate withdrawal amount
-        let remaining = acct
-            .deposited_amount
-            .checked_sub(acct.withdrawn_amount)
-            .ok_or(ErrorCode::InsufficientBalance)?;
-        
-        let requested_amount = amount.min(remaining);
-        require!(requested_amount > 0, ErrorCode::InvalidAmount);
-        
-        // Handle full vs partial withdrawal
-        let actual_amount = if requested_amount == remaining {
-            // Full withdrawal - take everything
-            acct.to_account_info().lamports()
-        } else {
-            // Partial withdrawal - respect rent exemption
-            let pda_balance = acct.to_account_info().lamports();
-            let rent_exempt = Rent::get()?.minimum_balance(CommitmentAccount::LEN);
-            let available = pda_balance.checked_sub(rent_exempt).unwrap_or(0);
-            
-            require!(requested_amount <= available, ErrorCode::InsufficientBalance);
-            requested_amount
-        };
-        
-        // Update state
-        acct.withdrawn_amount = acct
-            .withdrawn_amount
-            .checked_add(actual_amount)
-            .ok_or(ErrorCode::Overflow)?;
-        
-        // Transfer SOL
-        **acct.to_account_info().try_borrow_mut_lamports()? -= actual_amount;
-        **ctx.accounts.recipient.try_borrow_mut_lamports()? += actual_amount;
-        
-        msg!("✅ ZKP Withdrawal successful: {} lamports", actual_amount);
-        msg!("🔐 H1 was NEVER exposed on-chain!");
-        
-        // Close account if fully withdrawn
-        if acct.deposited_amount == acct.withdrawn_amount {
-            msg!("Closing empty commitment account");
-        }
-        
-        Ok(())
+ pub fn withdraw_zkp(
+    ctx: Context<WithdrawZKP>,
+    nonce: [u8; 32],
+    amount: u64,
+) -> Result<()> {
+    let acct = &mut ctx.accounts.commitment_account;
+    let expected_h2 = acct.commitment;
+    
+    // Create challenge and verify signature
+    let challenge = create_withdrawal_challenge(
+        &expected_h2,
+        &ctx.accounts.recipient.key(),
+        &nonce,
+        amount,
+    );
+    
+    verify_ed25519_signature(
+        &ctx.accounts.ix_sysvar,
+        &expected_h2,
+        &challenge,
+    )?;
+    
+    // Calculate remaining balance
+    let remaining = acct
+        .deposited_amount
+        .checked_sub(acct.withdrawn_amount)
+        .ok_or(ErrorCode::InsufficientBalance)?;
+    
+    // Validate requested amount
+    require!(amount > 0, ErrorCode::InvalidAmount);
+    
+    // 🔥 전액 출금 로직: 요청 금액이 잔액 이상이면 전부 + rent 반환
+    let (actual_amount, is_full_withdrawal) = if amount >= remaining {
+        // 전액 출금: PDA의 모든 lamports (잔액 + rent)
+        let total_lamports = acct.to_account_info().lamports();
+        (total_lamports, true)
+    } else {
+        // 부분 출금: 요청한 만큼만
+        (amount, false)
+    };
+    
+    // Update state
+    acct.withdrawn_amount = acct
+        .withdrawn_amount
+        .checked_add(if is_full_withdrawal { remaining } else { actual_amount })
+        .ok_or(ErrorCode::Overflow)?;
+    
+    // Transfer SOL
+    **acct.to_account_info().try_borrow_mut_lamports()? -= actual_amount;
+    **ctx.accounts.recipient.try_borrow_mut_lamports()? += actual_amount;
+    
+    msg!("✅ ZKP Withdrawal: {} lamports", actual_amount);
+    msg!("   Deposited: {}, Withdrawn: {}, Remaining: {}", 
+         acct.deposited_amount, 
+         acct.withdrawn_amount,
+         acct.deposited_amount - acct.withdrawn_amount);
+    
+    if is_full_withdrawal {
+        msg!("🔒 Full withdrawal - closing account and returning rent");
     }
+    
+    Ok(())
+}
 }
 
 /// Create challenge for withdrawal proof
@@ -129,8 +124,7 @@ fn create_withdrawal_challenge(
     sha256_hash(&data).to_bytes()
 }
 
-/// Verify Ed25519 signature proof
-/// Ed25519 프로그램이 instruction 0번에서 이미 검증을 완료했는지 확인
+
 fn verify_ed25519_signature(
     ix_sysvar: &AccountInfo,
     expected_pubkey: &[u8; 32],
@@ -256,7 +250,6 @@ pub struct WithdrawZKP<'info> {
         mut,
         seeds = [b"commitment", commitment_account.commitment.as_ref()],
         bump,
-        close = recipient
     )]
     pub commitment_account: Account<'info, CommitmentAccount>,
     
@@ -316,3 +309,59 @@ pub enum ErrorCode {
     #[msg("Invalid message size")]
     InvalidMessageSize,
 }
+
+
+// challenge = hash(H2 + recipient + nonce + amount)
+//          = hash([공개] + [공개] + [공개] + [공개])
+// ```
+
+// **모든 입력값이 공개 정보!**
+// - H2: 공개 (온체인에 저장)
+// - recipient: 공개 (트랜잭션에 명시)
+// - nonce: 공개 (트랜잭션에 명시)
+// - amount: 공개 (트랜잭션에 명시)
+
+// **Challenge도 공개 정보!** (Ed25519 instruction의 message에 포함)
+
+// ### 3. 비밀은 **서명**에 있음
+// ```
+// signature = sign(H1, challenge)
+//               ↑
+//            비밀키!
+// ```
+
+// **보안의 핵심:**
+// - **H1 (비밀키)을 알아야만** 유효한 서명 생성 가능
+// - Nonce, challenge를 알아도 **H1 없이는 서명 불가능**
+
+// ## 공격 시나리오 분석
+
+// ### 공격 1: C가 B의 nonce를 그대로 사용
+// ```
+// C가 시도:
+// challenge_C = hash(H2 + C_address + nonce_B + 0.25)
+// signature_C = sign(H1, challenge_C)
+// ```
+
+// **결과: ✅ 성공!**
+
+// **하지만 문제없는 이유:**
+// - C는 H1을 원래 알고 있음 (A가 줬으니까)
+// - C는 **자기 몫(0.25)**만 출금
+// - B의 몫(0.5)은 여전히 안전
+// ```
+// 실행 순서:
+// 1. C가 B의 nonce 사용해서 0.25 출금 → 성공
+// 2. B가 자기 nonce 사용해서 0.5 출금 → 성공
+// ```
+
+// **왜 안전?** Challenge에 **recipient와 amount가 포함**되어 있어서!
+
+// ### 공격 2: C가 B의 서명을 복사
+// ```
+// C가 B의 트랜잭션에서 복사:
+// - signature_B
+// - nonce_B
+// - amount: 0.5
+
+// C가 recipient만 자기 주소로 바꿔서 실행 시도

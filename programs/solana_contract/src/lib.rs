@@ -3,7 +3,7 @@ use anchor_lang::solana_program::hash::hash as sha256_hash;
 use anchor_lang::solana_program::ed25519_program;
 use anchor_lang::solana_program::sysvar::instructions::{load_instruction_at_checked, ID as IX_ID};
 
-declare_id!("3NEr6ZiHYsW6eP2w6tk84yoVdWsRiDyYoe5qxY6qrTKL");
+declare_id!("7EjvXnqXeniiXXSXCGC9UpeYXFwHSWmhWm2QDkqrxdJQ");
 
 const MIN_DEPOSIT_AMOUNT: u64 = 1_000_000;
 
@@ -11,13 +11,11 @@ const MIN_DEPOSIT_AMOUNT: u64 = 1_000_000;
 pub mod solana_contract {
     use super::*;
     
-    /// Deposit funds with h2 commitment
     pub fn deposit(
         ctx: Context<Deposit>,
         commitment: [u8; 32],
         amount: u64,
     ) -> Result<()> {
-        require!(amount > 0, ErrorCode::InvalidAmount);
         require!(amount >= MIN_DEPOSIT_AMOUNT, ErrorCode::AmountTooSmall);
         
         let acct = &mut ctx.accounts.commitment_account;
@@ -25,7 +23,6 @@ pub mod solana_contract {
         acct.deposited_amount = amount;
         acct.withdrawn_amount = 0;
         
-        // Transfer SOL to PDA
         let ix = anchor_lang::solana_program::system_instruction::transfer(
             &ctx.accounts.depositor.key(),
             &acct.to_account_info().key(),
@@ -37,164 +34,126 @@ pub mod solana_contract {
             &[ctx.accounts.depositor.to_account_info(), acct.to_account_info()],
         )?;
         
-        msg!("✅ Deposit: {} lamports", amount);
         Ok(())
     }
     
-    /// Direct withdrawal using ZK proof (no commit-reveal needed)
-    /// H1 is NEVER exposed on-chain!
- pub fn withdraw_zkp(
-    ctx: Context<WithdrawZKP>,
-    nonce: [u8; 32],
-    amount: u64,
-) -> Result<()> {
-    let acct = &mut ctx.accounts.commitment_account;
-    let expected_h2 = acct.commitment;
-    
-    // Create challenge and verify signature
-    let challenge = create_withdrawal_challenge(
-        &expected_h2,
-        &ctx.accounts.recipient.key(),
-        &nonce,
-        amount,
-    );
-    
-    verify_ed25519_signature(
-        &ctx.accounts.ix_sysvar,
-        &expected_h2,
-        &challenge,
-    )?;
-    
-    // Calculate remaining balance
-    let remaining = acct
-        .deposited_amount
-        .checked_sub(acct.withdrawn_amount)
-        .ok_or(ErrorCode::InsufficientBalance)?;
-    
-    // Validate requested amount
-    require!(amount > 0, ErrorCode::InvalidAmount);
-    
-    let (actual_amount, is_full_withdrawal) = if amount >= remaining {
-        let total_lamports = acct.to_account_info().lamports();
-        (total_lamports, true)
-    } else {
-        (amount, false)
-    };
-    
-    // Update state
-    acct.withdrawn_amount = acct
-        .withdrawn_amount
-        .checked_add(if is_full_withdrawal { remaining } else { actual_amount })
-        .ok_or(ErrorCode::Overflow)?;
-    
-    // Transfer SOL
-    **acct.to_account_info().try_borrow_mut_lamports()? -= actual_amount;
-    **ctx.accounts.recipient.try_borrow_mut_lamports()? += actual_amount;
-    
-    if is_full_withdrawal {
-        acct.commitment = [0; 32];
-        acct.deposited_amount = 0;
-        acct.withdrawn_amount = 0;
+    pub fn withdraw_zkp(
+        ctx: Context<WithdrawZKP>,
+        nonce: [u8; 32],
+        amount: u64,
+    ) -> Result<()> {
+        let acct = &mut ctx.accounts.commitment_account;
+        let expected_h2 = acct.commitment;
+        
+        let challenge = create_withdrawal_challenge(
+            &expected_h2,
+            &ctx.accounts.recipient.key(),
+            &nonce,
+            amount,
+        );
+        
+        verify_ed25519_signature(
+            &ctx.accounts.ix_sysvar,
+            &expected_h2,
+            &challenge,
+        )?;
+        
+        let remaining = acct
+            .deposited_amount
+            .checked_sub(acct.withdrawn_amount)
+            .ok_or(ErrorCode::InsufficientBalance)?;
+        
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        
+        let (actual_amount, is_full_withdrawal) = if amount >= remaining {
+            (acct.to_account_info().lamports(), true)
+        } else {
+            (amount, false)
+        };
+        
+        acct.withdrawn_amount = acct
+            .withdrawn_amount
+            .checked_add(if is_full_withdrawal { remaining } else { actual_amount })
+            .ok_or(ErrorCode::Overflow)?;
+        
+        **acct.to_account_info().try_borrow_mut_lamports()? -= actual_amount;
+        **ctx.accounts.recipient.try_borrow_mut_lamports()? += actual_amount;
+        
+        if is_full_withdrawal {
+            acct.commitment = [0; 32];
+            acct.deposited_amount = 0;
+            acct.withdrawn_amount = 0;
+        }
+        
+        Ok(())
     }
-    
-    Ok(())
-}
 }
 
-/// Create challenge for withdrawal proof
 fn create_withdrawal_challenge(
     h2: &[u8; 32],
     recipient: &Pubkey,
     nonce: &[u8; 32],
     amount: u64,
 ) -> [u8; 32] {
-    let mut data = Vec::with_capacity(32 + 32 + 32 + 8);
+    let mut data = Vec::with_capacity(104);
     data.extend_from_slice(h2);
     data.extend_from_slice(recipient.as_ref());
     data.extend_from_slice(nonce);
     data.extend_from_slice(&amount.to_le_bytes());
-    
     sha256_hash(&data).to_bytes()
 }
-
 
 fn verify_ed25519_signature(
     ix_sysvar: &AccountInfo,
     expected_pubkey: &[u8; 32],
     expected_message: &[u8; 32],
 ) -> Result<()> {
-    require!(
-        ix_sysvar.key == &IX_ID,
-        ErrorCode::InvalidInstructionSysvar
-    );
+    require!(ix_sysvar.key == &IX_ID, ErrorCode::InvalidInstructionSysvar);
     
     let ix = load_instruction_at_checked(0, ix_sysvar)
         .map_err(|_| ErrorCode::Ed25519InstructionNotFound)?;
     
-    require!(
-        ix.program_id == ed25519_program::ID,
-        ErrorCode::InvalidEd25519Instruction
-    );
+    require!(ix.program_id == ed25519_program::ID, ErrorCode::InvalidEd25519Instruction);
     
     let data = &ix.data;
-    require!(data.len() >= 16, ErrorCode::InvalidEd25519InstructionData); // 16 not 17!
+    require!(data.len() >= 16 && data[0] == 1, ErrorCode::InvalidEd25519InstructionData);
     
-    let num_signatures = data[0];
-    require!(num_signatures == 1, ErrorCode::InvalidEd25519InstructionData);
-    
-    // Header: [0]=num_sigs, [1]=padding, [2-15]=offsets
     let sig_offset = u16::from_le_bytes([data[2], data[3]]) as usize;
-    let sig_ix_index = u16::from_le_bytes([data[4], data[5]]);
-    
     let pubkey_offset = u16::from_le_bytes([data[6], data[7]]) as usize;
-    let pubkey_ix_index = u16::from_le_bytes([data[8], data[9]]);
-    
     let msg_offset = u16::from_le_bytes([data[10], data[11]]) as usize;
     let msg_size = u16::from_le_bytes([data[12], data[13]]) as usize;
-    let msg_ix_index = u16::from_le_bytes([data[14], data[15]]);
     
-    
-    // All data should be in the Ed25519 instruction itself
     require!(
-        sig_ix_index == 0xFFFF && pubkey_ix_index == 0xFFFF && msg_ix_index == 0xFFFF,
+        u16::from_le_bytes([data[4], data[5]]) == 0xFFFF &&
+        u16::from_le_bytes([data[8], data[9]]) == 0xFFFF &&
+        u16::from_le_bytes([data[14], data[15]]) == 0xFFFF &&
+        msg_size == 32,
         ErrorCode::InvalidEd25519InstructionData
     );
     
-    // Verify message size
-    require!(msg_size == 32, ErrorCode::InvalidMessageSize);
-    
-    // Extract actual data from instruction
-    let sig_end = sig_offset + 64;
-    let pubkey_end = pubkey_offset + 32;
-    let msg_end = msg_offset + msg_size;
-    
     require!(
-        sig_end <= data.len() && pubkey_end <= data.len() && msg_end <= data.len(),
+        sig_offset + 64 <= data.len() && 
+        pubkey_offset + 32 <= data.len() && 
+        msg_offset + 32 <= data.len(),
         ErrorCode::InvalidEd25519InstructionData
     );
     
-    let actual_pubkey = &data[pubkey_offset..pubkey_end];
-    let actual_message = &data[msg_offset..msg_end];
-    
-    // Verify public key matches H2
     require!(
-        actual_pubkey == expected_pubkey,
+        &data[pubkey_offset..pubkey_offset + 32] == expected_pubkey,
         ErrorCode::PublicKeyMismatch
     );
     
-    // Verify message matches challenge
     require!(
-        actual_message == expected_message,
+        &data[msg_offset..msg_offset + 32] == expected_message,
         ErrorCode::MessageMismatch
     );
-
     
     Ok(())
 }
 
 #[account]
 pub struct CommitmentAccount {
-    pub commitment: [u8; 32],      // H2 (public commitment)
+    pub commitment: [u8; 32],
     pub deposited_amount: u64,
     pub withdrawn_amount: u64,
 }
@@ -214,10 +173,8 @@ pub struct Deposit<'info> {
         bump
     )]
     pub commitment_account: Account<'info, CommitmentAccount>,
-    
     #[account(mut)]
     pub depositor: Signer<'info>,
-    
     pub system_program: Program<'info, System>,
 }
 
@@ -229,15 +186,12 @@ pub struct WithdrawZKP<'info> {
         bump,
     )]
     pub commitment_account: Account<'info, CommitmentAccount>,
-    
+    /// CHECK: Ed25519 verified
     #[account(mut)]
-    pub recipient: Signer<'info>,
-    
-    /// Instruction sysvar for Ed25519 verification
+    pub recipient: AccountInfo<'info>,
     /// CHECK: Verified in instruction
     #[account(address = IX_ID)]
     pub ix_sysvar: AccountInfo<'info>,
-    
     pub system_program: Program<'info, System>,
 }
 
@@ -245,40 +199,22 @@ pub struct WithdrawZKP<'info> {
 pub enum ErrorCode {
     #[msg("Invalid amount")]
     InvalidAmount,
-    
-    #[msg("Amount too small - minimum 0.001 SOL")]
+    #[msg("Amount too small")]
     AmountTooSmall,
-    
     #[msg("Insufficient balance")]
     InsufficientBalance,
-    
-    #[msg("Arithmetic overflow")]
+    #[msg("Overflow")]
     Overflow,
-    
-    #[msg("Invalid ZK proof - failed to verify knowledge of H1")]
-    InvalidProof,
-    
     #[msg("Invalid instruction sysvar")]
     InvalidInstructionSysvar,
-    
     #[msg("Ed25519 instruction not found")]
     Ed25519InstructionNotFound,
-    
     #[msg("Invalid Ed25519 instruction")]
     InvalidEd25519Instruction,
-    
-    #[msg("Invalid Ed25519 instruction data format")]
+    #[msg("Invalid Ed25519 data")]
     InvalidEd25519InstructionData,
-    
-    #[msg("Signature mismatch")]
-    SignatureMismatch,
-    
     #[msg("Public key mismatch")]
     PublicKeyMismatch,
-    
     #[msg("Message mismatch")]
     MessageMismatch,
-    
-    #[msg("Invalid message size")]
-    InvalidMessageSize,
 }

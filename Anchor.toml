@@ -6,13 +6,13 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-solana_contract = "7EjvXnqXeniiXXSXCGC9UpeYXFwHSWmhWm2QDkqrxdJQ"
+solana_contract = "7GRCSrfQdwHfagVatiMscz8zowyCjY4wTrJ9h8TQ67MQ"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "devnet"
+cluster = "mainnet"
 wallet = "~/deployer-new.json"
 
 [scripts]

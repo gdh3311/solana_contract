@@ -3,7 +3,7 @@ use anchor_lang::solana_program::hash::hash as sha256_hash;
 use anchor_lang::solana_program::ed25519_program;
 use anchor_lang::solana_program::sysvar::instructions::{load_instruction_at_checked, ID as IX_ID};
 
-declare_id!("7EjvXnqXeniiXXSXCGC9UpeYXFwHSWmhWm2QDkqrxdJQ");
+declare_id!("7GRCSrfQdwHfagVatiMscz8zowyCjY4wTrJ9h8TQ67MQ");
 
 const MIN_DEPOSIT_AMOUNT: u64 = 1_000_000;
 

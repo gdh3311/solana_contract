@@ -7,6 +7,7 @@ skip-lint = false
 
 [programs.localnet]
 solana_contract = "7GRCSrfQdwHfagVatiMscz8zowyCjY4wTrJ9h8TQ67MQ"
+cold_wallet = "3qzzUeR3njJ2q398SAR4vZLW8cBdc3LKwBhWR9HPdGYa"
 
 [registry]
 url = "https://api.apr.dev"

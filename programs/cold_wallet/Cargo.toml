@@ -1,0 +1,20 @@
+[package]
+name = "cold_wallet"
+version = "0.1.0"
+description = "SOL deposits authorized by Ed25519 signatures with immutable IPFS metadata"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "cold_wallet"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = "0.31.1"
